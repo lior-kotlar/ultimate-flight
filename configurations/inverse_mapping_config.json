@@ -1,0 +1,15 @@
+{
+    "features_file": "data/train_datasets/train_input_forces_wingbeat_n16.pt",
+    "targets_file": "data/train_datasets/train_output_kinematics_wingbeat_n16.pt",
+    "n_samples_per_wingbeat": 16,
+    "batch_size": [32, 64, 128],
+    "lr": [0.001],
+    "weight_decay": [0.1, 0.01, 0.001],
+    "epochs": 100,
+    "hidden_dims": [[256, 128, 64], [512, 256, 128], [1024, 512, 256]],
+    "activation": ["ReLU", "LeakyReLU", "GELU", "Tanh"],
+    "dropout_rate": 0.1,
+    "train_split_ratio": 0.85,
+    "num_workers": 4,
+    "accumulation_steps": 1
+}
