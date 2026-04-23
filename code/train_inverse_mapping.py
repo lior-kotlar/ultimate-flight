@@ -190,7 +190,7 @@ def run_training_experiment(config, trainset, valset, train_kinematics_raw, devi
         print(f"[{run_label}] Epoch {epoch} | Val MSE: {val_loss:.4f} | Best: {best_val_loss:.4f}")
 
     # Log hparams to TensorBoard
-    clean_config = {k: v for k, v in config.items() if isinstance(v, (int, float, str, bool))}
+    clean_config = {k: (str(v) if isinstance(v, list) else v) for k, v in config.items() if isinstance(v, (int, float, str, bool, list))}
     writer.add_hparams(hparam_dict=clean_config, metric_dict={'hparam_best_val_loss': best_val_loss}, run_name="hparams")
     writer.close()
 
