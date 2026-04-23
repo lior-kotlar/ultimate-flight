@@ -1,15 +1,16 @@
 {
-    "features_file": "data/train_datasets/train_input_forces_wingbeat_n16.pt",
-    "targets_file": "data/train_datasets/train_output_kinematics_wingbeat_n16.pt",
-    "n_samples_per_wingbeat": 16,
+    "n_samples_per_wingbeat": [16, 24, 32],
     "batch_size": 32,
     "lr": 0.001,
-    "weight_decay": 0.01,
+    "weight_decay": 0.1,
     "epochs": 100,
-    "hidden_dims": [[1024, 512, 256]],
+    "hidden_dims": [[
+        1024,
+        512,
+        256
+    ]],
     "activation": "GELU",
     "dropout_rate": 0.1,
-    "train_split_ratio": 0.85,
     "num_workers": 4,
     "accumulation_steps": 1
 }

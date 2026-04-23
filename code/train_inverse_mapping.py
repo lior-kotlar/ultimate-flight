@@ -18,6 +18,12 @@ from tqdm.auto import tqdm
 
 from inverse_mapping_model import InverseMappingModel
 
+current_dir = os.path.dirname(os.path.abspath(__file__))
+data_handling_dir = os.path.join(current_dir, 'data_handling')
+if data_handling_dir not in sys.path:
+    sys.path.append(data_handling_dir)
+from build_per_wingbeat_datasets import run_per_wingbeat_builder
+
 # ---------------------------------------------------------
 # DIRECTORY SETUP
 # ---------------------------------------------------------
@@ -220,8 +226,6 @@ def main():
     with open(args.config, 'r') as f: 
         raw_config = json.load(f)
         
-    FEATURES_FILE = raw_config.pop("features_file")
-    TARGETS_FILE = raw_config.pop("targets_file")
     TRAIN_RATIO = raw_config.pop("train_split_ratio", 0.85)
 
     listified_config = {k: (v if isinstance(v, list) else [v]) for k, v in raw_config.items()}
@@ -229,48 +233,68 @@ def main():
     config_combinations = [dict(zip(keys, combo)) for combo in itertools.product(*values)]
     
     print("==> FRESH RUN INITIATED")
-    print("==> Generating and saving new Train/Val indices...")
-    
-    # 2. Load dataset
-    print("==> Loading master dataset files...")
-    X_full = torch.load(FEATURES_FILE, map_location='cpu')
-    y_full = torch.load(TARGETS_FILE, map_location='cpu')
-
-    total_samples = len(X_full)
-    torch.manual_seed(42)
-    indices = torch.randperm(total_samples)
-    train_size = int(TRAIN_RATIO * total_samples)
-    
-    train_indices = indices[:train_size].tolist()
-    val_indices = indices[train_size:].tolist()
-
-    X_train_raw = [X_full[i] for i in train_indices]
-    y_train_raw = [y_full[i] for i in train_indices]
-    X_val_raw = [X_full[i] for i in val_indices]
-    y_val_raw = [y_full[i] for i in val_indices]
-    
-    # 3. Create datasets natively
-    n_samples = config_combinations[0]["n_samples_per_wingbeat"]
-    trainset = InverseMappingDataset(X_train_raw, y_train_raw, n_samples)
-    valset = InverseMappingDataset(X_val_raw, y_val_raw, n_samples)
-
-    print(f"Dataset split: {len(X_train_raw)} Train | {len(X_val_raw)} Val")
     print(f"==> Executing {len(config_combinations)} pending configuration(s).")
-
-    # 4. Global experiment directory
+    
+    # Global experiment directory
     exp_dir = os.path.join(RUNS_DIRECTORY, f"{args.name}_{datetime.now().strftime('%Y_%m_%d_%H%M%S')}")
     os.makedirs(exp_dir, exist_ok=True)
     
     best_overall_loss = float('inf')
     best_config_name = None
 
+    dataset_cache = {}
+    train_indices_cache = {}
+    
     # 5. Run over all configs
     for idx, config in enumerate(config_combinations):
+        n_samples = config["n_samples_per_wingbeat"]
         run_idx = idx + 1
         
         print(f"\n==========================================")
-        print(f"   STARTING RUN {run_idx} of {len(config_combinations)}")
+        print(f"   STARTING RUN {run_idx} of {len(config_combinations)} (n_samples={n_samples})")
         print(f"==========================================")
+
+        # 2. Check / Build / Load Dataset for this n_samples
+        if n_samples not in dataset_cache:
+            input_path = os.path.join("data", "train_datasets", f"train_input_forces_wingbeat_n{n_samples}.pt")
+            target_path = os.path.join("data", "train_datasets", f"train_output_kinematics_wingbeat_n{n_samples}.pt")
+            
+            if not (os.path.exists(input_path) and os.path.exists(target_path)):
+                print(f"==> Dataset for n_samples={n_samples} not found. Generating now...")
+                run_per_wingbeat_builder(
+                    n_samples_per_wingbeat=n_samples,
+                    forces_indication_vector="1111",     
+                    use_radians=True,
+                    min_peak_distance=20
+                )
+                
+            print(f"==> Loading master dataset files for n_samples={n_samples}...")
+            X_full = torch.load(input_path, map_location='cpu')
+            y_full = torch.load(target_path, map_location='cpu')
+            
+            total_samples = len(X_full)
+            if n_samples not in train_indices_cache: # Generate indices per n_samples to account for differing sequence lengths
+                torch.manual_seed(42)
+                indices = torch.randperm(total_samples)
+                train_size = int(TRAIN_RATIO * total_samples)
+                train_indices_cache[n_samples] = (indices[:train_size].tolist(), indices[train_size:].tolist())
+                print(f"==> Generated and saved new Train/Val indices for n={n_samples}.")
+
+            train_indices, val_indices = train_indices_cache[n_samples]
+
+            X_train_raw = [X_full[i] for i in train_indices]
+            y_train_raw = [y_full[i] for i in train_indices]
+            X_val_raw = [X_full[i] for i in val_indices]
+            y_val_raw = [y_full[i] for i in val_indices]
+            
+            dataset_cache[n_samples] = (X_train_raw, y_train_raw, X_val_raw, y_val_raw)
+            print(f"Dataset split for n_samples={n_samples}: {len(X_train_raw)} Train | {len(X_val_raw)} Val")
+            
+        X_train_raw, y_train_raw, X_val_raw, y_val_raw = dataset_cache[n_samples]
+        
+        # 3. Create datasets natively
+        trainset = InverseMappingDataset(X_train_raw, y_train_raw, n_samples)
+        valset = InverseMappingDataset(X_val_raw, y_val_raw, n_samples)
         
         run_name = f"config_{run_idx}"
         run_dir = os.path.join(exp_dir, run_name)

@@ -292,32 +292,47 @@ def run_prediction_for_directory(run_dir, dataset_features, dataset_targets, gro
 def main():
     parser = argparse.ArgumentParser(description="Predict using saved Inverse Mapping Model(s)")
     parser.add_argument("directory", type=str, help="Path to either a parent experiment directory or a specific configuration run directory")
-    parser.add_argument("dataset_pt", type=str, help="Path to a .pt file containing prediction dataset (features)")
-    parser.add_argument("ground_truth_pt", type=str, help="Path to a .pt file containing ground truth trajectories")
+    # --- CHANGED: Now expects a directory and a base movie identifier instead of exact file paths ---
+    parser.add_argument("dataset_dir", type=str, help="Path to the directory containing prediction datasets (e.g., data/prediction_datasets)")
+    parser.add_argument("base_name", type=str, help="Base identifier of the movie/sequence (e.g., mov51_2)")
     parser.add_argument("--output_name", type=str, default="predictions.pt", help="Output .pt filename to save inside each run directory")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    dataset_pt_path = os.path.abspath(args.dataset_pt)
-    if not os.path.exists(dataset_pt_path):
-        raise FileNotFoundError(f"Dataset .pt file was not found: {dataset_pt_path}")
-
-    ground_truth_pt_path = os.path.abspath(args.ground_truth_pt)
-    if not os.path.exists(ground_truth_pt_path):
-        raise FileNotFoundError(f"Ground truth .pt file was not found: {ground_truth_pt_path}")
-
-    dataset_features, dataset_targets = load_prediction_inputs(dataset_pt_path)
-    ground_truth_sequences = load_ground_truth_sequences(ground_truth_pt_path)
     run_dirs = resolve_run_directories(args.directory)
 
     print(f"Using device: {device}")
-    print(f"Dataset source: {dataset_pt_path}")
-    print(f"Ground truth source: {ground_truth_pt_path}")
-    print(f"Discovered {len(run_dirs)} run directory(ies) to predict.")
+    print(f"Dataset directory: {args.dataset_dir}")
+    print(f"Base sequence name: {args.base_name}")
+    print(f"Discovered {len(run_dirs)} run directory(ies) to evaluate.")
 
     for run_dir in run_dirs:
         try:
+            # 1. Peek at the config to get n_samples_per_wingbeat BEFORE loading the model
+            config_path = os.path.join(run_dir, "config.json")
+            with open(config_path, "r") as f:
+                config = json.load(f)
+            n_samples = config.get("n_samples_per_wingbeat", 16)
+
+            # 2. Construct the expected file paths based on the dataset builder's default naming convention
+            inputs_filename = f"pred_inputs_{args.base_name}_wingbeat_n{n_samples}.pt"
+            targets_filename = f"pred_targets_{args.base_name}_wingbeat_n{n_samples}.pt"
+            
+            inputs_path = os.path.join(args.dataset_dir, inputs_filename)
+            targets_path = os.path.join(args.dataset_dir, targets_filename)
+
+            # 3. Validate existence
+            if not os.path.exists(inputs_path) or not os.path.exists(targets_path):
+                print(f"\n[!] Warning: Datasets for n={n_samples} not found for base name '{args.base_name}'.")
+                print(f"    Expected: {inputs_path}")
+                print(f"    Skipping run: {run_dir}")
+                continue
+
+            # 4. Load the dynamically resolved datasets
+            dataset_features, dataset_targets = load_prediction_inputs(inputs_path)
+            ground_truth_sequences = load_ground_truth_sequences(targets_path)
+
+            # 5. Run prediction (Make sure you still have the shape fix applied to this function from earlier!)
             run_prediction_for_directory(
                 run_dir=run_dir,
                 dataset_features=dataset_features,
