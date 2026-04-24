@@ -124,25 +124,24 @@ def inverse_transform_sequence_list(scaler, seq_list):
         return seq_list
     return [scaler.inverse_transform(seq) for seq in seq_list]
 
-def predict_autoregressive(model, seq_kin, gt_w_0, device):
-    """
-    seq_kin: [T, 12] kinematics sequence
-    gt_w_0: [n*6] initial wing angle condition
-    Returns: pred_w: [T, n*6] the predicted wing trajectory
-    """
+def predict_autoregressive(model, seq_kin, gt_w_0, target_scaler, device):
     T = seq_kin.shape[0]
-    preds = [gt_w_0.cpu()]
     
-    curr_wing = gt_w_0.unsqueeze(0).to(device) # [1, n*6]
+    # Use the scaler to normalize the initial condition
+    curr_wing_norm = target_scaler.transform(gt_w_0.unsqueeze(0).to(device))
+    
+    preds = [gt_w_0.cpu()] # Keep the unnormalized (radians) ground truth for step 0
     
     for t in range(1, T):
-        kin_k = seq_kin[t].unsqueeze(0).to(device) # [1, 12]
+        kin_k = seq_kin[t].unsqueeze(0).to(device)
         
         with torch.no_grad():
-            pred_wing = model(kin_k, curr_wing) # [1, n*6]
+            pred_wing_norm = model(kin_k, curr_wing_norm) 
             
-        preds.append(pred_wing.squeeze(0).cpu())
-        curr_wing = pred_wing
+        # Unnormalize model's prediction back to radians
+        pred_wing = target_scaler.inverse_transform(pred_wing_norm).squeeze(0).cpu()
+        preds.append(pred_wing)
+        curr_wing_norm = pred_wing_norm
         
     return torch.stack(preds, dim=0) # [T, n*6]
 
@@ -248,42 +247,55 @@ def run_prediction_for_directory(run_dir, dataset_features, dataset_targets, gro
     for i in tqdm(range(len(dataset_features)), desc="Predicting sequences"):
         seq_kin = dataset_features[i] # [T, 12]
         
-        gt_w = ground_truth_sequences[i] # [T, n, 6] or [T, n*6]
-        if gt_w.ndim == 3:
+        gt_w = ground_truth_sequences[i] 
+        
+        # Shape fix for inputs
+        if gt_w.ndim == 2 and gt_w.shape[1] == 6:
+            remainder = gt_w.shape[0] % n_samples_per_wingbeat
+            if remainder != 0:
+                gt_w = gt_w[:-remainder] 
+            gt_w = gt_w.reshape(-1, n_samples_per_wingbeat * 6)
+        elif gt_w.ndim == 3:
             gt_w = gt_w.reshape(gt_w.shape[0], -1)
             
         gt_w_0 = gt_w[0] # [n*6]
         
-        preds_seq = predict_autoregressive(model, seq_kin, gt_w_0, device)
+        # Pass the scaler into the loop!
+        preds_seq = predict_autoregressive(model, seq_kin, gt_w_0, target_scaler, device)
         all_preds_list.append(preds_seq)
 
-    unnormalized_predictions = inverse_transform_sequence_list(target_scaler, all_preds_list)
-
     save_payload = {
-        "predictions": unnormalized_predictions,
+        "predictions": all_preds_list,
         "run_dir": run_dir,
     }
 
     if dataset_targets is not None:
-        unnormalized_targets = inverse_transform_sequence_list(target_scaler, ground_truth_sequences)
         mse_list = []
-        for p, t in zip(unnormalized_predictions, unnormalized_targets):
-            if t.ndim == 3:
+        for p, t in zip(all_preds_list, ground_truth_sequences):
+            
+            # Shape fix for targets
+            if t.ndim == 2 and t.shape[1] == 6:
+                remainder = t.shape[0] % n_samples_per_wingbeat
+                if remainder != 0:
+                    t = t[:-remainder]
+                t = t.reshape(-1, n_samples_per_wingbeat * 6)
+            elif t.ndim == 3:
                 t = t.reshape(t.shape[0], -1)
+                
             common_len = min(p.shape[0], t.shape[0])
             mse_list.append(torch.mean((p[:common_len] - t[:common_len]) ** 2).item())
             
         mean_mse = float(np.mean(mse_list))
-        save_payload["targets"] = unnormalized_targets
+        save_payload["targets"] = ground_truth_sequences
         save_payload["mean_mse"] = mean_mse
-        print(f"Mean MSE (unnormalized): {mean_mse:.6f}")
+        print(f"Mean MSE (radians): {mean_mse:.6f}")
 
     output_path = os.path.join(run_dir, output_name)
     torch.save(save_payload, output_path)
     print(f"Saved predictions to: {output_path}")
 
     save_prediction_plots(
-        predictions=unnormalized_predictions, 
+        predictions=all_preds_list, 
         ground_truth_sequences=ground_truth_sequences, 
         n_samples_per_wingbeat=n_samples_per_wingbeat,
         run_dir=run_dir

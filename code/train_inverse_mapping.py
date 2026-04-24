@@ -5,10 +5,16 @@ import argparse
 import itertools
 from datetime import datetime
 import gc
-import math
+import pickle
+from loguru import logger 
+
+# Remove the default logger that prints everything to stderr
+logger.remove()
+
+# Add a new logger that ONLY prints ERRORs (and CRITICALs) to stderr
+logger.add(sys.stderr, level="ERROR")
 
 import torch
-import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
@@ -17,6 +23,7 @@ import torch.backends.cudnn as cudnn
 from tqdm.auto import tqdm
 
 from inverse_mapping_model import InverseMappingModel
+from normalizer import NormalizerFactory
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 data_handling_dir = os.path.join(current_dir, 'data_handling')
@@ -34,17 +41,7 @@ os.makedirs(RUNS_DIRECTORY, exist_ok=True)
 # DATASET
 # ---------------------------------------------------------
 class InverseMappingDataset(Dataset):
-    """
-    Given a list of [T, 12] input trajectories and [T, n, 6] label trajectories,
-    this dataset extracts all adjacent (k-1, k) wingbeat pairs.
-    
-    Input:
-        kin_k: 12-dimensional body kinematics at time k
-        wing_k_minus_1: n*6 flattened wing angles at time k-1
-    Label:
-        wing_k: n*6 flattened wing angles at time k
-    """
-    def __init__(self, kinematics_list, wing_angles_list, n_samples_per_wingbeat):
+    def __init__(self, kinematics_list, wing_angles_list, n_samples_per_wingbeat, target_scaler): # <--- Add target_scaler here
         self.n = n_samples_per_wingbeat
         kin_k_items = []
         wing_k_minus_1_items = []
@@ -54,10 +51,9 @@ class InverseMappingDataset(Dataset):
             if k_seq.shape[0] < 2:
                 continue
                 
-            # Sequence transitions
-            k_k = k_seq[1:]  # [T-1, 12]
-            w_prev = w_seq[:-1].reshape(-1, self.n * 6)  # [T-1, n*6]
-            w_curr = w_seq[1:].reshape(-1, self.n * 6)   # [T-1, n*6]
+            k_k = k_seq[1:]  
+            w_prev = w_seq[:-1].reshape(-1, self.n * 6)  
+            w_curr = w_seq[1:].reshape(-1, self.n * 6)   
             
             kin_k_items.append(k_k)
             wing_k_minus_1_items.append(w_prev)
@@ -67,8 +63,12 @@ class InverseMappingDataset(Dataset):
             raise ValueError("No valid sequence transitions found in data.")
             
         self.kin_k = torch.cat(kin_k_items, dim=0).float()
-        self.wing_k_minus_1 = torch.cat(wing_k_minus_1_items, dim=0).float()
-        self.wing_k = torch.cat(wing_k_items, dim=0).float()
+        wing_k_minus_1 = torch.cat(wing_k_minus_1_items, dim=0).float()
+        wing_k = torch.cat(wing_k_items, dim=0).float()
+
+        # --- Use the passed target_scaler to transform targets ---
+        self.wing_k_minus_1 = target_scaler.transform(wing_k_minus_1)
+        self.wing_k = target_scaler.transform(wing_k)
 
     def __len__(self):
         return self.kin_k.shape[0]
@@ -131,7 +131,7 @@ def evaluate(epoch, model, dataloader, device, disable_tqdm=False):
 # ---------------------------------------------------------
 # PIPELINE ENCAPSULATION
 # ---------------------------------------------------------
-def run_training_experiment(config, trainset, valset, train_kinematics_raw, device, run_dir, disable_tqdm=False, conf_idx=None):
+def run_training_experiment(config, trainset, valset, train_kinematics_raw, device, run_dir, target_scaler, disable_tqdm=False, conf_idx=None):
     run_label = f"Config {conf_idx}" if conf_idx else "Single Config"
     print(f"\n[{run_label}] Output Directory: {run_dir}")
     os.makedirs(run_dir, exist_ok=True)
@@ -152,6 +152,9 @@ def run_training_experiment(config, trainset, valset, train_kinematics_raw, devi
 
     with open(os.path.join(run_dir, 'config.json'), 'w') as f:
         json.dump(config, f, indent=4)
+
+    with open(os.path.join(run_dir, 'target_scaler.pkl'), 'wb') as f:
+        pickle.dump(target_scaler, f)
 
     trainloader = DataLoader(trainset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
     valloader = DataLoader(valset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
@@ -291,11 +294,13 @@ def main():
             print(f"Dataset split for n_samples={n_samples}: {len(X_train_raw)} Train | {len(X_val_raw)} Val")
             
         X_train_raw, y_train_raw, X_val_raw, y_val_raw = dataset_cache[n_samples]
+
+        target_scaler = NormalizerFactory.create('physicalwing')
         
         # 3. Create datasets natively
-        trainset = InverseMappingDataset(X_train_raw, y_train_raw, n_samples)
-        valset = InverseMappingDataset(X_val_raw, y_val_raw, n_samples)
-        
+        trainset = InverseMappingDataset(X_train_raw, y_train_raw, n_samples, target_scaler)
+        valset = InverseMappingDataset(X_val_raw, y_val_raw, n_samples, target_scaler)
+
         run_name = f"config_{run_idx}"
         run_dir = os.path.join(exp_dir, run_name)
         
@@ -306,6 +311,7 @@ def main():
             train_kinematics_raw=X_train_raw,
             device=DEVICE,
             run_dir=run_dir,
+            target_scaler=target_scaler,
             disable_tqdm=DISABLE_PBARS,
             conf_idx=run_idx
         )

@@ -195,6 +195,55 @@ class VectorNormScaler(Normalizer):
         elif isinstance(data, list):
             return [tensor * self.scale_factors for tensor in data]
 
+import math
+class PhysicalWingNormalizer(Normalizer):
+    """ 
+    Scales wing kinematics by their physical bounds: 
+    Stroke (phi) & Rotation (psi) by pi.
+    Deviation (theta) by 0.5.
+    Assumes features are grouped in multiples of 6: [L_phi, L_theta, L_psi, R_phi, R_theta, R_psi]
+    """
+    def __init__(self, global_normalizer: bool = True):
+        super().__init__(global_normalizer)
+
+    def _get_scale_factors(self, data_tensor: torch.Tensor) -> torch.Tensor:
+        """ Dynamically builds the scale factors based on the tensor's last dimension """
+        D = data_tensor.shape[-1]
+        if D % 6 != 0:
+            raise ValueError(f"PhysicalWingNormalizer requires feature dimensions to be a multiple of 6, got {D}")
+        
+        n_samples = D // 6
+        # Create the base scale on the same device and dtype as the incoming tensor
+        base_scale = torch.tensor(
+            [math.pi, 0.5, math.pi, math.pi, 0.5, math.pi], 
+            dtype=data_tensor.dtype, 
+            device=data_tensor.device
+        )
+        return base_scale.repeat(n_samples)
+
+    def fit(self, data: torch.Tensor | list[torch.Tensor]) -> None:
+        pass  # Fixed physical constants, no data-fitting required
+
+    def transform(self, data: torch.Tensor | list[torch.Tensor]) -> torch.Tensor | list[torch.Tensor]:
+        if isinstance(data, torch.Tensor):
+            scale = self._get_scale_factors(data)
+            return data / scale
+        elif isinstance(data, list):
+            if len(data) == 0: return data
+            scale = self._get_scale_factors(data[0])
+            return [tensor / scale for tensor in data]
+
+    def fit_transform(self, data: torch.Tensor | list[torch.Tensor]) -> torch.Tensor | list[torch.Tensor]:
+        return self.transform(data)
+
+    def inverse_transform(self, data: torch.Tensor | list[torch.Tensor]) -> torch.Tensor | list[torch.Tensor]:
+        if isinstance(data, torch.Tensor):
+            scale = self._get_scale_factors(data)
+            return data * scale
+        elif isinstance(data, list):
+            if len(data) == 0: return data
+            scale = self._get_scale_factors(data[0])
+            return [tensor * scale for tensor in data]
 
 class NormalizerFactory:
     """ a normalizers factory class """
@@ -207,6 +256,8 @@ class NormalizerFactory:
             return MinMax(global_normalizer)
         elif normalizer_type.lower() == 'vectornorm':
             return VectorNormScaler(global_normalizer)
+        elif normalizer_type.lower() == 'physicalwing':  # <--- NEW ADDITION
+            return PhysicalWingNormalizer(global_normalizer)
         elif normalizer_type.lower() == 'identity' or normalizer_type is None:
             return Identity(global_normalizer)
         else:

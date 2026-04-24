@@ -5,12 +5,20 @@
     "weight_decay": 0.1,
     "epochs": 100,
     "hidden_dims": [[
+        512,
+        256,
+        128
+    ],[
         1024,
         512,
         256
+    ], [
+        2048,
+        1024,
+        512
     ]],
     "activation": "GELU",
-    "dropout_rate": 0.1,
+    "dropout_rate": [0.1, 0.3],
     "num_workers": 4,
     "accumulation_steps": 1
 }
