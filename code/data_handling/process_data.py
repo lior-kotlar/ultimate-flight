@@ -236,29 +236,68 @@ def build_datasets(forces_indication_vector, use_radians=True):
         if file.endswith('.h5'):
             inputs, targets = _extract_features_and_targets(os.path.join(PROCESSED_PREDICTION_FLIGHT_DATA_DIR, file), forces_indication_vector, use_radians=use_radians)
             
-            base_name = file.replace(PROCESSED_FILE_SUFFIX, "")
+            AUGMENTED_SUFFIX = "_condensed_data_augmented.h5"
+            if file.endswith(AUGMENTED_SUFFIX):
+                base_name = file.replace(AUGMENTED_SUFFIX, "_augmented")
+            else:
+                base_name = file.replace(PROCESSED_FILE_SUFFIX, "")
+            
             torch.save([torch.from_numpy(inputs)], os.path.join(PREDICTION_DATASETS_DIR, f"pred_inputs_{base_name}.pt"))
             torch.save([torch.from_numpy(targets)], os.path.join(PREDICTION_DATASETS_DIR, f"pred_targets_{base_name}.pt"))
             pred_count += 1
             
     logger.info(f"Created {pred_count} isolated prediction datasets in {PREDICTION_DATASETS_DIR}")
 
-def run_full_pipeline(unprocessed_dir, n_predict, forces_indication_vector, use_radians=True):
+def _normalize_prediction_filename(prediction_file):
+    """Normalize user input into a raw-data filename ending with UNPROCESSED_FILE_SUFFIX."""
+    if prediction_file is None:
+        return None
+
+    candidate = os.path.basename(prediction_file.strip())
+    if not candidate:
+        raise ValueError("--prediction_file cannot be empty.")
+
+    if candidate.endswith(UNPROCESSED_FILE_SUFFIX):
+        return candidate
+
+    if candidate.endswith(PROCESSED_FILE_SUFFIX):
+        return candidate.replace(PROCESSED_FILE_SUFFIX, UNPROCESSED_FILE_SUFFIX)
+
+    return f"{candidate}{UNPROCESSED_FILE_SUFFIX}"
+
+
+def run_full_pipeline(unprocessed_dir, n_predict, forces_indication_vector, use_radians=True, prediction_file=None):
     logger.info("Cleaning up output directories from previous runs...")
     _clear_directory(PROCESSED_TRAIN_FLIGHT_DATA_DIR)
     _clear_directory(PROCESSED_PREDICTION_FLIGHT_DATA_DIR)
     _clear_directory(PREDICTION_DATASETS_DIR)
     _clear_directory(TRAIN_DATASETS_DIR)
     logger.info("Cleanup complete.")
+
     all_files = [f for f in os.listdir(unprocessed_dir) if f.endswith(UNPROCESSED_FILE_SUFFIX)]
-    if len(all_files) <= n_predict:
-        raise ValueError(f"Not enough files! Found {len(all_files)}, but requested {n_predict} for prediction.")
+    if not all_files:
+        raise ValueError(f"No files ending with {UNPROCESSED_FILE_SUFFIX} found in {unprocessed_dir}.")
 
-    random.shuffle(all_files)
-    predict_files = all_files[:n_predict]
-    train_files = all_files[n_predict:]
+    selected_prediction_file = _normalize_prediction_filename(prediction_file)
+    if selected_prediction_file is not None:
+        if selected_prediction_file not in all_files:
+            raise ValueError(
+                f"Requested prediction file '{selected_prediction_file}' was not found in {unprocessed_dir}."
+            )
+        predict_files = [selected_prediction_file]
+        train_files = [f for f in all_files if f != selected_prediction_file]
+        logger.info(
+            f"Found {len(all_files)} files. Using explicit prediction file {selected_prediction_file}; "
+            f"{len(train_files)} files remain for training."
+        )
+    else:
+        if len(all_files) <= n_predict:
+            raise ValueError(f"Not enough files! Found {len(all_files)}, but requested {n_predict} for prediction.")
 
-    logger.info(f"Found {len(all_files)} files. Reserving {n_predict} for prediction, {len(train_files)} for training.")
+        random.shuffle(all_files)
+        predict_files = all_files[:n_predict]
+        train_files = all_files[n_predict:]
+        logger.info(f"Found {len(all_files)} files. Reserving {n_predict} for prediction, {len(train_files)} for training.")
 
     for file in train_files:
         save_path = _process_single_h5(os.path.join(unprocessed_dir, file), PROCESSED_TRAIN_FLIGHT_DATA_DIR)
@@ -277,9 +316,17 @@ if __name__ == '__main__':
     parser.add_argument('--unprocessed_dir', type=str, default=UNPROCESSED_FLIGHT_DATA_DIR, help="Directory containing raw H5 files")
     parser.add_argument('--forces', type=str, required=True, help="4-bit indication string (e.g., 1111)")
     parser.add_argument('--n_predict', type=int, default=1, help="Number of experiments to hold out for the prediction dataset")
+    parser.add_argument('--prediction_file', type=str, default=None,
+                        help="Optional explicit file for prediction holdout. If provided, random selection is disabled.")
     parser.add_argument('--radians', action=argparse.BooleanOptionalAction, default=True, 
                         help="Convert target angles to radians (Default: True). Pass --no-radians to keep degrees.")
     
     args = parser.parse_args()
     
-    run_full_pipeline(args.unprocessed_dir, args.n_predict, args.forces, args.radians)
+    run_full_pipeline(
+        args.unprocessed_dir,
+        args.n_predict,
+        args.forces,
+        args.radians,
+        prediction_file=args.prediction_file,
+    )
