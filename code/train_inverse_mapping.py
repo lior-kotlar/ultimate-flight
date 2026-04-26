@@ -41,9 +41,13 @@ os.makedirs(RUNS_DIRECTORY, exist_ok=True)
 # DATASET
 # ---------------------------------------------------------
 class InverseMappingDataset(Dataset):
-    def __init__(self, kinematics_list, wing_angles_list, n_samples_per_wingbeat, target_scaler, kinematics_window_size=1):
+    def __init__(self, kinematics_list, wing_angles_list, n_samples_per_wingbeat, target_scaler, kinematics_window_size=1, use_scheduled_sampling=False):
         self.n = n_samples_per_wingbeat
         self.window_size = kinematics_window_size
+        self.use_ss = use_scheduled_sampling
+        
+        self.data = []
+        
         kin_k_items = []
         wing_k_minus_1_items = []
         wing_k_items = []
@@ -52,50 +56,117 @@ class InverseMappingDataset(Dataset):
             if k_seq.shape[0] <= self.window_size:
                 continue
             
+            seq_kin_k = []
+            seq_w_prev = []
+            seq_w_curr = []
+            
             # Create sliding windows for kinematics
             for t in range(1, k_seq.shape[0] - self.window_size + 1):
                 kin_window = k_seq[t : t + self.window_size].flatten()
                 w_prev = w_seq[t - 1].reshape(self.n * 6)
                 w_curr = w_seq[t].reshape(self.n * 6)
                 
-                kin_k_items.append(kin_window.unsqueeze(0))
-                wing_k_minus_1_items.append(w_prev.unsqueeze(0))
-                wing_k_items.append(w_curr.unsqueeze(0))
+                if self.use_ss:
+                    seq_kin_k.append(kin_window)
+                    seq_w_prev.append(w_prev)
+                    seq_w_curr.append(w_curr)
+                else:
+                    kin_k_items.append(kin_window.unsqueeze(0))
+                    wing_k_minus_1_items.append(w_prev.unsqueeze(0))
+                    wing_k_items.append(w_curr.unsqueeze(0))
             
-        if not kin_k_items:
-            raise ValueError("No valid sequence transitions found in data.")
+            if self.use_ss and seq_kin_k:
+                kin_k_tensor = torch.stack(seq_kin_k).float()
+                w_prev_tensor = target_scaler.transform(torch.stack(seq_w_prev).float())
+                w_curr_tensor = target_scaler.transform(torch.stack(seq_w_curr).float())
+                self.data.append((kin_k_tensor, w_prev_tensor, w_curr_tensor))
             
-        self.kin_k = torch.cat(kin_k_items, dim=0).float()
-        wing_k_minus_1 = torch.cat(wing_k_minus_1_items, dim=0).float()
-        wing_k = torch.cat(wing_k_items, dim=0).float()
+        if not self.use_ss:
+            if not kin_k_items:
+                raise ValueError("No valid sequence transitions found in data.")
+                
+            self.kin_k = torch.cat(kin_k_items, dim=0).float()
+            wing_k_minus_1 = torch.cat(wing_k_minus_1_items, dim=0).float()
+            wing_k = torch.cat(wing_k_items, dim=0).float()
 
-        # --- Use the passed target_scaler to transform targets ---
-        self.wing_k_minus_1 = target_scaler.transform(wing_k_minus_1)
-        self.wing_k = target_scaler.transform(wing_k)
+            # --- Use the passed target_scaler to transform targets ---
+            self.wing_k_minus_1 = target_scaler.transform(wing_k_minus_1)
+            self.wing_k = target_scaler.transform(wing_k)
 
     def __len__(self):
+        if self.use_ss:
+            return len(self.data)
         return self.kin_k.shape[0]
 
     def __getitem__(self, idx):
+        if self.use_ss:
+            return self.data[idx]
         return self.kin_k[idx], self.wing_k_minus_1[idx], self.wing_k[idx]
 
 
 # ---------------------------------------------------------
 # TRAINING LOOP
 # ---------------------------------------------------------
-def train_epoch(epoch, model, dataloader, optimizer, device, accumulation_steps=1, disable_tqdm=False):
+def train_epoch(epoch, model, dataloader, optimizer, device, accumulation_steps=1, disable_tqdm=False, use_ss=False, total_epochs=1, wing_noise_std=0.0):
     model.train()
     total_loss = 0
     pbar = tqdm(enumerate(dataloader), total=len(dataloader), leave=False, disable=disable_tqdm)
     optimizer.zero_grad()
 
+    # Linear decay for teacher forcing from 1.0 down to 0.0 (only used if use_ss=True)
+    teacher_forcing_ratio = max(0.0, 1.0 - (epoch - 1) / max(1, total_epochs))
+
     for batch_idx, (kin_k, wing_prev, wing_curr) in pbar:
-        kin_k = kin_k.to(device)
-        wing_prev = wing_prev.to(device)
-        wing_curr = wing_curr.to(device)
-        
-        preds = model(kin_k, wing_prev)
-        loss = F.mse_loss(preds, wing_curr)
+        if not use_ss:
+            kin_k = kin_k.to(device)
+            wing_prev = wing_prev.to(device)
+            wing_curr = wing_curr.to(device)
+            
+            if wing_noise_std > 0.0:
+                noisy_wing_prev = wing_prev + torch.randn_like(wing_prev) * wing_noise_std
+            else:
+                noisy_wing_prev = wing_prev
+            
+            preds = model(kin_k, noisy_wing_prev)
+            loss = F.mse_loss(preds, wing_curr)
+        else:
+            loss = torch.tensor(0.0, device=device)
+            total_steps = 0
+            
+            for i in range(len(kin_k)):
+                seq_kin = kin_k[i].to(device)
+                seq_w_prev = wing_prev[i].to(device)
+                seq_w_curr = wing_curr[i].to(device)
+                
+                T = seq_kin.shape[0]
+                if T == 0:
+                    continue
+                    
+                curr_input_prev = seq_w_prev[0].unsqueeze(0)
+                if wing_noise_std > 0.0:
+                    curr_input_prev = curr_input_prev + torch.randn_like(curr_input_prev) * wing_noise_std
+                
+                seq_loss = 0
+                
+                for t in range(T):
+                    kin_step = seq_kin[t].unsqueeze(0)
+                    
+                    pred = model(kin_step, curr_input_prev)
+                    seq_loss += F.mse_loss(pred, seq_w_curr[t].unsqueeze(0))
+                    
+                    if t < T - 1:
+                        if torch.rand(1).item() < teacher_forcing_ratio:
+                            curr_input_prev = seq_w_prev[t+1].unsqueeze(0)
+                            if wing_noise_std > 0.0:
+                                curr_input_prev = curr_input_prev + torch.randn_like(curr_input_prev) * wing_noise_std
+                        else:
+                            curr_input_prev = pred.detach()
+                            
+                loss += seq_loss / T
+                total_steps += 1
+                
+            loss = loss / max(1, total_steps)
+
         loss = loss / accumulation_steps
         
         loss.backward()
@@ -112,18 +183,49 @@ def train_epoch(epoch, model, dataloader, optimizer, device, accumulation_steps=
     return total_loss / len(dataloader)
 
 
-def evaluate(epoch, model, dataloader, device, disable_tqdm=False):
+def evaluate(epoch, model, dataloader, device, disable_tqdm=False, use_ss=False):
     model.eval()
     total_loss = 0
     with torch.no_grad():
         pbar = tqdm(enumerate(dataloader), total=len(dataloader), leave=False, disable=disable_tqdm)
         for batch_idx, (kin_k, wing_prev, wing_curr) in pbar:
-            kin_k = kin_k.to(device)
-            wing_prev = wing_prev.to(device)
-            wing_curr = wing_curr.to(device)
-            
-            preds = model(kin_k, wing_prev)
-            loss = F.mse_loss(preds, wing_curr)
+            if not use_ss:
+                kin_k = kin_k.to(device)
+                wing_prev = wing_prev.to(device)
+                wing_curr = wing_curr.to(device)
+                
+                preds = model(kin_k, wing_prev)
+                loss = F.mse_loss(preds, wing_curr)
+            else:
+                loss = torch.tensor(0.0, device=device)
+                total_steps = 0
+                
+                for i in range(len(kin_k)):
+                    seq_kin = kin_k[i].to(device)
+                    seq_w_prev = wing_prev[i].to(device)
+                    seq_w_curr = wing_curr[i].to(device)
+                    
+                    T = seq_kin.shape[0]
+                    if T == 0:
+                        continue
+                        
+                    curr_input_prev = seq_w_prev[0].unsqueeze(0)
+                    seq_loss = 0
+                    
+                    for t in range(T):
+                        kin_step = seq_kin[t].unsqueeze(0)
+                        pred = model(kin_step, curr_input_prev)
+                        seq_loss += F.mse_loss(pred, seq_w_curr[t].unsqueeze(0))
+                        
+                        if t < T - 1:
+                            # Standard evaluation is pure autoregressive without teacher forcing
+                            curr_input_prev = pred.detach()
+                            
+                    loss += seq_loss / T
+                    total_steps += 1
+                    
+                loss = loss / max(1, total_steps)
+
             total_loss += loss.item()
             
             pbar.set_description(f"Val Epoch: {epoch} | MSE: {total_loss/(batch_idx+1):.4f}")
@@ -151,6 +253,8 @@ def run_training_experiment(config, trainset, valset, train_kinematics_raw, devi
         DROPOUT = config.get("dropout_rate", 0.1)
         ACCUMULATION_STEPS = config.get("accumulation_steps", 1)
         KINEMATICS_WINDOW_SIZE = config.get("kinematics_window_size", 1)
+        USE_SS = config.get("use_scheduled_sampling", False)
+        WING_NOISE_STD = config.get("wing_noise_std", 0.0)
     except KeyError as e:
         raise KeyError(f"Missing required parameter in config: {e}")
 
@@ -160,8 +264,17 @@ def run_training_experiment(config, trainset, valset, train_kinematics_raw, devi
     with open(os.path.join(run_dir, 'target_scaler.pkl'), 'wb') as f:
         pickle.dump(target_scaler, f)
 
-    trainloader = DataLoader(trainset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
-    valloader = DataLoader(valset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
+    def get_collate_fn(use_ss):
+        if not use_ss:
+            return None
+        def collate(batch):
+            kins, w_prevs, w_currs = zip(*batch)
+            return list(kins), list(w_prevs), list(w_currs)
+        return collate
+
+    collate_fn = get_collate_fn(USE_SS)
+    trainloader = DataLoader(trainset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, collate_fn=collate_fn)
+    valloader = DataLoader(valset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, collate_fn=collate_fn)
 
     # Initialize model
     model = InverseMappingModel(
@@ -189,8 +302,8 @@ def run_training_experiment(config, trainset, valset, train_kinematics_raw, devi
     
     print(f"[{run_label}] Starting Training Loop...")
     for epoch in range(1, EPOCHS + 1):
-        train_loss = train_epoch(epoch, model, trainloader, optimizer, device, ACCUMULATION_STEPS, disable_tqdm=disable_tqdm)
-        val_loss = evaluate(epoch, model, valloader, device, disable_tqdm=disable_tqdm)
+        train_loss = train_epoch(epoch, model, trainloader, optimizer, device, ACCUMULATION_STEPS, disable_tqdm=disable_tqdm, use_ss=USE_SS, total_epochs=EPOCHS, wing_noise_std=WING_NOISE_STD)
+        val_loss = evaluate(epoch, model, valloader, device, disable_tqdm=disable_tqdm, use_ss=USE_SS)
         scheduler.step()
         
         writer.add_scalar('Loss/Train', train_loss, epoch)
@@ -304,8 +417,16 @@ def main():
         
         # 3. Create datasets natively
         kin_window_size = config.get("kinematics_window_size", 1)
-        trainset = InverseMappingDataset(X_train_raw, y_train_raw, n_samples, target_scaler, kinematics_window_size=kin_window_size)
-        valset = InverseMappingDataset(X_val_raw, y_val_raw, n_samples, target_scaler, kinematics_window_size=kin_window_size)
+        use_ss = config.get("use_scheduled_sampling", False)
+        
+        trainset = InverseMappingDataset(
+            X_train_raw, y_train_raw, n_samples, target_scaler, 
+            kinematics_window_size=kin_window_size, use_scheduled_sampling=use_ss
+        )
+        valset = InverseMappingDataset(
+            X_val_raw, y_val_raw, n_samples, target_scaler, 
+            kinematics_window_size=kin_window_size, use_scheduled_sampling=use_ss
+        )
 
         run_name = f"config_{run_idx}"
         run_dir = os.path.join(exp_dir, run_name)
