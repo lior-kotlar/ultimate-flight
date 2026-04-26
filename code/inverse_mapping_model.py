@@ -23,6 +23,7 @@ class InverseMappingModel(nn.Module):
         hidden_dims: Optional[List[int]] = None,
         dropout_rate: float = 0.1,
         activation: str = "ReLU",
+        kinematics_window_size: int = 1,
     ):
         """
         Args:
@@ -30,11 +31,13 @@ class InverseMappingModel(nn.Module):
             hidden_dims: List of hidden layer dimensions. Defaults to [256, 128, 64].
             dropout_rate: Dropout probability for regularization.
             activation: Activation function to use in hidden layers (ReLU, Tanh, ELU).
+            kinematics_window_size: Number of consecutive kinematic samples to use as input.
         """
         super().__init__()
         
         self.n_samples_per_wingbeat = n_samples_per_wingbeat
-        self.kinematics_dim = 12
+        self.kinematics_window_size = kinematics_window_size
+        self.kinematics_dim = 12 * kinematics_window_size
         self.wing_angles_dim = 6
         self.flattened_prev_wings_dim = n_samples_per_wingbeat * self.wing_angles_dim
         
@@ -128,7 +131,11 @@ class InverseMappingModel(nn.Module):
         if not self._normalizer_fitted:
             kinematics_normalized = kinematics_k
         else:
-            kinematics_normalized = self.kinematics_normalizer.transform(kinematics_k)
+            # Reshape to [..., 12] for proper VectorNormScaler application
+            original_shape = kinematics_k.shape
+            reshaped_kinematics = kinematics_k.reshape(-1, 12)
+            normalized_reshaped = self.kinematics_normalizer.transform(reshaped_kinematics)
+            kinematics_normalized = normalized_reshaped.view(original_shape)
         
         # Concatenate inputs
         combined_input = torch.cat([kinematics_normalized, wing_angles_k_minus_1_flattened], dim=-1)
@@ -157,6 +164,7 @@ class InverseMappingModel(nn.Module):
                 "hidden_dims": self.hidden_dims,
                 "dropout_rate": self.dropout_rate,
                 "activation": self.activation,
+                "kinematics_window_size": getattr(self, "kinematics_window_size", 1),
             },
         }
         
@@ -187,6 +195,7 @@ class InverseMappingModel(nn.Module):
             hidden_dims=config["hidden_dims"],
             dropout_rate=config["dropout_rate"],
             activation=config.get("activation", "ReLU"),
+            kinematics_window_size=config.get("kinematics_window_size", 1),
         )
         model.load_state_dict(checkpoint["model_state_dict"])
         

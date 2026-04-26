@@ -124,7 +124,7 @@ def inverse_transform_sequence_list(scaler, seq_list):
         return seq_list
     return [scaler.inverse_transform(seq) for seq in seq_list]
 
-def predict_autoregressive(model, seq_kin, gt_w_0, target_scaler, device):
+def predict_autoregressive(model, seq_kin, gt_w_0, target_scaler, device, kinematics_window_size=1):
     T = seq_kin.shape[0]
     
     # Use the scaler to normalize the initial condition
@@ -132,11 +132,11 @@ def predict_autoregressive(model, seq_kin, gt_w_0, target_scaler, device):
     
     preds = [gt_w_0.cpu()] # Keep the unnormalized (radians) ground truth for step 0
     
-    for t in range(1, T):
-        kin_k = seq_kin[t].unsqueeze(0).to(device)
+    for t in range(1, T - kinematics_window_size + 1):
+        kin_window = seq_kin[t:t+kinematics_window_size].flatten().unsqueeze(0).to(device)
         
         with torch.no_grad():
-            pred_wing_norm = model(kin_k, curr_wing_norm) 
+            pred_wing_norm = model(kin_window, curr_wing_norm) 
             
         # Unnormalize model's prediction back to radians
         pred_wing = target_scaler.inverse_transform(pred_wing_norm).squeeze(0).cpu()
@@ -147,52 +147,69 @@ def predict_autoregressive(model, seq_kin, gt_w_0, target_scaler, device):
 
 def make_wing_angle_figure(pred_seq, gt_seq, n_samples_per_wingbeat, sample_idx, run_name):
     subplot_titles = [
-        "Left Wing Angle 1", "Right Wing Angle 1",
-        "Left Wing Angle 2", "Right Wing Angle 2",
-        "Left Wing Angle 3", "Right Wing Angle 3",
+        "Left Wing - Stroke (φ)", "Right Wing - Stroke (φ)",
+        "Left Wing - Deviation (θ)", "Right Wing - Deviation (θ)",
+        "Left Wing - Roll/Rotation (ψ)", "Right Wing - Roll/Rotation (ψ)",
     ]
 
     fig = make_subplots(
         rows=3,
         cols=2,
-        shared_xaxes=False,
+        shared_xaxes="columns",
         subplot_titles=subplot_titles,
-        vertical_spacing=0.08,
+        vertical_spacing=0.06, 
         horizontal_spacing=0.08,
     )
 
-    # Flatten the sequence to include all samples per wingbeat sequentially
-    # Shape of sequences is [T, n*6] -> reshape to [T * n, 6]
     pred_seq = pred_seq.reshape(-1, 6)
     gt_seq = gt_seq.reshape(-1, 6)
 
     gt_x = np.arange(gt_seq.shape[0])
     pred_x = np.arange(pred_seq.shape[0])
 
+    # --- CHANGED: Added angle names for the legend ---
+    angle_names = ["Stroke", "Deviation", "Roll"] 
+
     for row_idx in range(3):
         left_dim = row_idx
         right_dim = row_idx + 3
         row = row_idx + 1
+        angle_name = angle_names[row_idx]
 
+        # Left Wing - Shows legend, defines the group
         fig.add_trace(
-            go.Scatter(x=gt_x, y=gt_seq[:, left_dim], mode="lines", name="Ground Truth", line=dict(color="#1f77b4")),
+            go.Scatter(x=gt_x, y=gt_seq[:, left_dim], mode="lines", 
+                       name=f"Ground Truth ({angle_name})", 
+                       legendgroup=f"gt_{angle_name}", 
+                       line=dict(color="#1f77b4")),
             row=row, col=1
         )
         fig.add_trace(
-            go.Scatter(x=pred_x, y=pred_seq[:, left_dim], mode="lines", name="Prediction", line=dict(color="#d62728", dash="dash")),
+            go.Scatter(x=pred_x, y=pred_seq[:, left_dim], mode="lines", 
+                       name=f"Prediction ({angle_name})", 
+                       legendgroup=f"pred_{angle_name}", 
+                       line=dict(color="#d62728", dash="dash")),
             row=row, col=1
         )
+        
+        # Right Wing - Hides legend, but belongs to the same group
         fig.add_trace(
-            go.Scatter(x=gt_x, y=gt_seq[:, right_dim], mode="lines", name="Ground Truth", line=dict(color="#1f77b4"), showlegend=False),
+            go.Scatter(x=gt_x, y=gt_seq[:, right_dim], mode="lines", 
+                       name=f"Ground Truth ({angle_name})", 
+                       legendgroup=f"gt_{angle_name}", 
+                       line=dict(color="#1f77b4"), showlegend=False),
             row=row, col=2
         )
         fig.add_trace(
-            go.Scatter(x=pred_x, y=pred_seq[:, right_dim], mode="lines", name="Prediction", line=dict(color="#d62728", dash="dash"), showlegend=False),
+            go.Scatter(x=pred_x, y=pred_seq[:, right_dim], mode="lines", 
+                       name=f"Prediction ({angle_name})", 
+                       legendgroup=f"pred_{angle_name}", 
+                       line=dict(color="#d62728", dash="dash"), showlegend=False),
             row=row, col=2
         )
 
-        fig.update_yaxes(title_text="Angle", row=row, col=1)
-        fig.update_yaxes(title_text="Angle", row=row, col=2)
+        fig.update_yaxes(title_text="Angle (rad)", row=row, col=1)
+        fig.update_yaxes(title_text="Angle (rad)", row=row, col=2)
 
     fig.update_xaxes(title_text="Time Step", row=3, col=1)
     fig.update_xaxes(title_text="Time Step", row=3, col=2)
@@ -202,6 +219,7 @@ def make_wing_angle_figure(pred_seq, gt_seq, n_samples_per_wingbeat, sample_idx,
         height=1000,
         width=1400,
         template="plotly_white",
+        hovermode="x unified"
     )
     return fig
 
@@ -241,6 +259,7 @@ def run_prediction_for_directory(run_dir, dataset_features, dataset_targets, gro
     print(f"\n=== Predicting for run directory: {run_dir}")
     model, config, target_scaler = load_run(run_dir, device)
     n_samples_per_wingbeat = config.get("n_samples_per_wingbeat", 16)
+    kin_window_size = config.get("kinematics_window_size", 1)
 
     all_preds_list = []
     
@@ -261,7 +280,7 @@ def run_prediction_for_directory(run_dir, dataset_features, dataset_targets, gro
         gt_w_0 = gt_w[0] # [n*6]
         
         # Pass the scaler into the loop!
-        preds_seq = predict_autoregressive(model, seq_kin, gt_w_0, target_scaler, device)
+        preds_seq = predict_autoregressive(model, seq_kin, gt_w_0, target_scaler, device, kinematics_window_size=kin_window_size)
         all_preds_list.append(preds_seq)
 
     save_payload = {

@@ -41,23 +41,26 @@ os.makedirs(RUNS_DIRECTORY, exist_ok=True)
 # DATASET
 # ---------------------------------------------------------
 class InverseMappingDataset(Dataset):
-    def __init__(self, kinematics_list, wing_angles_list, n_samples_per_wingbeat, target_scaler): # <--- Add target_scaler here
+    def __init__(self, kinematics_list, wing_angles_list, n_samples_per_wingbeat, target_scaler, kinematics_window_size=1):
         self.n = n_samples_per_wingbeat
+        self.window_size = kinematics_window_size
         kin_k_items = []
         wing_k_minus_1_items = []
         wing_k_items = []
         
         for k_seq, w_seq in zip(kinematics_list, wing_angles_list):
-            if k_seq.shape[0] < 2:
+            if k_seq.shape[0] <= self.window_size:
                 continue
-                
-            k_k = k_seq[1:]  
-            w_prev = w_seq[:-1].reshape(-1, self.n * 6)  
-            w_curr = w_seq[1:].reshape(-1, self.n * 6)   
             
-            kin_k_items.append(k_k)
-            wing_k_minus_1_items.append(w_prev)
-            wing_k_items.append(w_curr)
+            # Create sliding windows for kinematics
+            for t in range(1, k_seq.shape[0] - self.window_size + 1):
+                kin_window = k_seq[t : t + self.window_size].flatten()
+                w_prev = w_seq[t - 1].reshape(self.n * 6)
+                w_curr = w_seq[t].reshape(self.n * 6)
+                
+                kin_k_items.append(kin_window.unsqueeze(0))
+                wing_k_minus_1_items.append(w_prev.unsqueeze(0))
+                wing_k_items.append(w_curr.unsqueeze(0))
             
         if not kin_k_items:
             raise ValueError("No valid sequence transitions found in data.")
@@ -147,6 +150,7 @@ def run_training_experiment(config, trainset, valset, train_kinematics_raw, devi
         ACTIVATION = config.get("activation", "ReLU")
         DROPOUT = config.get("dropout_rate", 0.1)
         ACCUMULATION_STEPS = config.get("accumulation_steps", 1)
+        KINEMATICS_WINDOW_SIZE = config.get("kinematics_window_size", 1)
     except KeyError as e:
         raise KeyError(f"Missing required parameter in config: {e}")
 
@@ -164,7 +168,8 @@ def run_training_experiment(config, trainset, valset, train_kinematics_raw, devi
         n_samples_per_wingbeat=N_SAMPLES,
         hidden_dims=HIDDEN_DIMS,
         dropout_rate=DROPOUT,
-        activation=ACTIVATION
+        activation=ACTIVATION,
+        kinematics_window_size=KINEMATICS_WINDOW_SIZE,
     )
     
     # Fit normalizer on raw train kinematics
@@ -298,8 +303,9 @@ def main():
         target_scaler = NormalizerFactory.create('physicalwing')
         
         # 3. Create datasets natively
-        trainset = InverseMappingDataset(X_train_raw, y_train_raw, n_samples, target_scaler)
-        valset = InverseMappingDataset(X_val_raw, y_val_raw, n_samples, target_scaler)
+        kin_window_size = config.get("kinematics_window_size", 1)
+        trainset = InverseMappingDataset(X_train_raw, y_train_raw, n_samples, target_scaler, kinematics_window_size=kin_window_size)
+        valset = InverseMappingDataset(X_val_raw, y_val_raw, n_samples, target_scaler, kinematics_window_size=kin_window_size)
 
         run_name = f"config_{run_idx}"
         run_dir = os.path.join(exp_dir, run_name)

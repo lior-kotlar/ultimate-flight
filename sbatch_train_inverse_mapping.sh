@@ -4,9 +4,8 @@
 #SBATCH -e logs/%x_%J.err
 #SBATCH --mem=32g
 #SBATCH --cpus-per-task=4
-#SBATCH --time=04:00:00
+#SBATCH --time=01:00:00
 #SBATCH --gres=gpu:1
-#SBATCH --exclude=catfish-[01-05]
 #SBATCH --mail-user=lior.kotlar@mail.huji.ac.il
 #SBATCH --mail-type=END,FAIL
 
