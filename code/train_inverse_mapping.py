@@ -107,7 +107,21 @@ class InverseMappingDataset(Dataset):
 # ---------------------------------------------------------
 # TRAINING LOOP
 # ---------------------------------------------------------
-def train_epoch(epoch, model, dataloader, optimizer, device, accumulation_steps=1, disable_tqdm=False, use_ss=False, total_epochs=1, wing_noise_std=0.0):
+def train_epoch(
+        epoch,
+        model,
+        dataloader,
+        optimizer,
+        device,
+        accumulation_steps=1,
+        disable_tqdm=False,
+        use_ss=False,
+        total_epochs=1,
+        wing_noise_std=0.0,
+        unroll_steps=1,
+        maneuver_threshold=0.0,
+        maneuver_weight=1.0
+    ):
     model.train()
     total_loss = 0
     pbar = tqdm(enumerate(dataloader), total=len(dataloader), leave=False, disable=disable_tqdm)
@@ -121,14 +135,33 @@ def train_epoch(epoch, model, dataloader, optimizer, device, accumulation_steps=
             kin_k = kin_k.to(device)
             wing_prev = wing_prev.to(device)
             wing_curr = wing_curr.to(device)
-            
+
             if wing_noise_std > 0.0:
                 noisy_wing_prev = wing_prev + torch.randn_like(wing_prev) * wing_noise_std
             else:
                 noisy_wing_prev = wing_prev
-            
+
             preds = model(kin_k, noisy_wing_prev)
-            loss = F.mse_loss(preds, wing_curr)
+            
+            # --- DEBUGGING: Tell PyTorch to keep the gradient for the predictions ---
+            # preds.retain_grad() 
+
+            # Compute weighted loss based on maneuver detection
+            batch_size = kin_k.shape[0]
+            weights = torch.ones(batch_size, device=device)
+
+            mask = None
+            if maneuver_threshold > 0.0:
+                ang_accel = kin_k[:, -3:]
+                mask = torch.any(torch.abs(ang_accel) > maneuver_threshold, dim=1)
+                # if torch.any(mask):
+                #     print(f"\n[DEBUG Batch {batch_idx}] Maneuver samples detected: {mask.sum().item()} out of {batch_size}")
+                # else:
+                #     print(f"\n[DEBUG Batch {batch_idx}] No maneuver samples detected.")
+                weights[mask] = maneuver_weight
+
+            raw_loss = F.mse_loss(preds, wing_curr, reduction='none')
+            loss = (raw_loss.mean(dim=1) * weights).mean()
         else:
             loss = torch.tensor(0.0, device=device)
             total_steps = 0
@@ -147,20 +180,31 @@ def train_epoch(epoch, model, dataloader, optimizer, device, accumulation_steps=
                     curr_input_prev = curr_input_prev + torch.randn_like(curr_input_prev) * wing_noise_std
                 
                 seq_loss = 0
-                
+
                 for t in range(T):
                     kin_step = seq_kin[t].unsqueeze(0)
-                    
+
                     pred = model(kin_step, curr_input_prev)
-                    seq_loss += F.mse_loss(pred, seq_w_curr[t].unsqueeze(0))
-                    
+
+                    # Compute weight based on maneuver detection
+                    weight = 1.0
+                    if maneuver_threshold > 0.0:
+                        ang_accel = kin_step[0, -3:]
+                        if torch.any(torch.abs(ang_accel) > maneuver_threshold):
+                            weight = maneuver_weight
+
+                    seq_loss += F.mse_loss(pred, seq_w_curr[t].unsqueeze(0)) * weight
+
                     if t < T - 1:
                         if torch.rand(1).item() < teacher_forcing_ratio:
                             curr_input_prev = seq_w_prev[t+1].unsqueeze(0)
                             if wing_noise_std > 0.0:
                                 curr_input_prev = curr_input_prev + torch.randn_like(curr_input_prev) * wing_noise_std
                         else:
-                            curr_input_prev = pred.detach()
+                            if (t + 1) % unroll_steps == 0:
+                                curr_input_prev = pred.detach()
+                            else:
+                                curr_input_prev = pred
                             
                 loss += seq_loss / T
                 total_steps += 1
@@ -170,6 +214,18 @@ def train_epoch(epoch, model, dataloader, optimizer, device, accumulation_steps=
         loss = loss / accumulation_steps
         
         loss.backward()
+            
+        # # --- DEBUGGING: Compare the gradient magnitudes immediately after backward() ---
+        # if maneuver_threshold > 0.0 and mask is not None and batch_idx % 50 == 0: # Print every 50 batches
+        #     maneuver_indices = torch.where(mask)[0]
+        #     hover_indices = torch.where(~mask)[0]
+            
+        #     # Only print if we have both types in this specific batch
+        #     if len(maneuver_indices) > 0 and len(hover_indices) > 0:
+        #         grad_maneuver = preds.grad[maneuver_indices].abs().mean().item()
+        #         grad_hover = preds.grad[hover_indices].abs().mean().item()
+        #         ratio = grad_maneuver / grad_hover if grad_hover > 0 else 0
+        #         # print(f"\n[DEBUG Batch {batch_idx}] Grad Magnitude -> Maneuver: {grad_maneuver:.6f} | Hover: {grad_hover:.6f} | Ratio: {ratio:.1f}x")
         
         if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(dataloader):
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -255,6 +311,9 @@ def run_training_experiment(config, trainset, valset, train_kinematics_raw, devi
         KINEMATICS_WINDOW_SIZE = config.get("kinematics_window_size", 1)
         USE_SS = config.get("use_scheduled_sampling", False)
         WING_NOISE_STD = config.get("wing_noise_std", 0.0)
+        UNROLL_STEPS = config.get("unroll_steps", 1)
+        MANEUVER_THRESHOLD = config.get("maneuver_threshold", 0.0)
+        MANEUVER_WEIGHT = config.get("maneuver_weight_multiplier", 1.0)
     except KeyError as e:
         raise KeyError(f"Missing required parameter in config: {e}")
 
@@ -302,7 +361,12 @@ def run_training_experiment(config, trainset, valset, train_kinematics_raw, devi
     
     print(f"[{run_label}] Starting Training Loop...")
     for epoch in range(1, EPOCHS + 1):
-        train_loss = train_epoch(epoch, model, trainloader, optimizer, device, ACCUMULATION_STEPS, disable_tqdm=disable_tqdm, use_ss=USE_SS, total_epochs=EPOCHS, wing_noise_std=WING_NOISE_STD)
+        train_loss = train_epoch(
+            epoch, model, trainloader, optimizer, device, ACCUMULATION_STEPS,
+            disable_tqdm=disable_tqdm, use_ss=USE_SS, total_epochs=EPOCHS,
+            wing_noise_std=WING_NOISE_STD, unroll_steps=UNROLL_STEPS,
+            maneuver_threshold=MANEUVER_THRESHOLD, maneuver_weight=MANEUVER_WEIGHT
+        )
         val_loss = evaluate(epoch, model, valloader, device, disable_tqdm=disable_tqdm, use_ss=USE_SS)
         scheduler.step()
         
@@ -377,8 +441,8 @@ def main():
 
         # 2. Check / Build / Load Dataset for this n_samples
         if n_samples not in dataset_cache:
-            input_path = os.path.join("data", "train_datasets", f"train_input_forces_wingbeat_n{n_samples}.pt")
-            target_path = os.path.join("data", "train_datasets", f"train_output_kinematics_wingbeat_n{n_samples}.pt")
+            input_path = os.path.join("data", "train_datasets", f"train_input_forces_wingbeat_n{n_samples}_splitmin.pt")
+            target_path = os.path.join("data", "train_datasets", f"train_output_kinematics_wingbeat_n{n_samples}_splitmin.pt")
             
             if not (os.path.exists(input_path) and os.path.exists(target_path)):
                 print(f"==> Dataset for n_samples={n_samples} not found. Generating now...")
