@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from typing import List, Optional
 
-from normalizer import VectorNormScaler
+from normalizer import VectorNormScaler, ZScore, ZScore
 
 
 class InverseMappingModel(nn.Module):
@@ -40,9 +40,10 @@ class InverseMappingModel(nn.Module):
         self.kinematics_dim = 12 * kinematics_window_size
         self.wing_angles_dim = 6
         self.flattened_prev_wings_dim = n_samples_per_wingbeat * self.wing_angles_dim
+        self.speed_dim = 1
         
         # Input dimensions after concatenation
-        self.input_dim = self.kinematics_dim + self.flattened_prev_wings_dim
+        self.input_dim = self.kinematics_dim + self.flattened_prev_wings_dim + self.speed_dim
         
         if hidden_dims is None:
             hidden_dims = [256, 128, 64]
@@ -74,20 +75,17 @@ class InverseMappingModel(nn.Module):
             prev_dim = hidden_dim
         
         # Output layer
-        layers.append(nn.Linear(prev_dim, self.flattened_prev_wings_dim))
-        
         self.fc_network = nn.Sequential(*layers)
+        self.wing_head = nn.Linear(prev_dim, self.flattened_prev_wings_dim)
+        self.speed_head = nn.Linear(prev_dim, 1)
         
-        # Normalizer for kinematics (will be fitted during training)
+        # Normalizers (will be fitted during training)
         self.kinematics_normalizer = VectorNormScaler(global_normalizer=True)
         self._normalizer_fitted = False
     
-    def fit_normalizer(self, kinematics_data: torch.Tensor | List[torch.Tensor]) -> None:
+    def fit_normalizer(self, kinematics_data: torch.Tensor | List[torch.Tensor], speed_data: torch.Tensor | List[torch.Tensor] = None) -> None:
         """
-        Fit the VectorNormScaler on kinematic data.
-        
-        Args:
-            kinematics_data: Either a tensor of shape [N, 12] or list of [Ki, 12] tensors.
+        Fit the normalizers on train data.
         """
         self.kinematics_normalizer.fit(kinematics_data)
         self._normalizer_fitted = True
@@ -96,6 +94,7 @@ class InverseMappingModel(nn.Module):
         self,
         kinematics_k: torch.Tensor,
         wing_angles_k_minus_1_flattened: torch.Tensor,
+        speed_k: torch.Tensor,
     ) -> torch.Tensor:
         """
         Forward pass for inverse mapping.
@@ -127,23 +126,41 @@ class InverseMappingModel(nn.Module):
                 f"got {wing_angles_k_minus_1_flattened.shape[-1]}"
             )
         
-        # Normalize kinematics
+        # Normalize kinematics and speed
         if not self._normalizer_fitted:
             kinematics_normalized = kinematics_k
+            speed_normalized = speed_k
         else:
-            # Reshape to [..., 12] for proper VectorNormScaler application
-            original_shape = kinematics_k.shape
-            reshaped_kinematics = kinematics_k.reshape(-1, 12)
-            normalized_reshaped = self.kinematics_normalizer.transform(reshaped_kinematics)
-            kinematics_normalized = normalized_reshaped.view(original_shape)
+                original_shape = kinematics_k.shape
+                reshaped_kinematics = kinematics_k.reshape(-1, 12)
+                normalized_reshaped = self.kinematics_normalizer.transform(reshaped_kinematics)
+                kinematics_normalized = normalized_reshaped.view(original_shape)
+                
+                # --- FIXED: Use a stable static multiplier ---
+                speed_normalized = speed_k * 100.0
+        
+        # Make sure speed is aligned
+        if speed_normalized.dim() == 1:
+            speed_normalized = speed_normalized.unsqueeze(-1)
+        if speed_normalized.shape[-1] != 1:
+            # Handle sequence shapes if any
+            pass
+            
+        if speed_normalized.dim() > wing_angles_k_minus_1_flattened.dim():
+            speed_normalized = speed_normalized.squeeze(0)
+            
+        # Concatenate speed to the wing angle vector
+        wing_with_speed = torch.cat([wing_angles_k_minus_1_flattened, speed_normalized], dim=-1)
         
         # Concatenate inputs
-        combined_input = torch.cat([kinematics_normalized, wing_angles_k_minus_1_flattened], dim=-1)
+        combined_input = torch.cat([kinematics_normalized, wing_with_speed], dim=-1)
         
         # Pass through FC network
-        wing_angles_k = self.fc_network(combined_input)
+        features = self.fc_network(combined_input)
+        wing_angles_k = self.wing_head(features)
+        speed_k_pred = self.speed_head(features)
         
-        return wing_angles_k
+        return wing_angles_k, speed_k_pred
     
     def get_normalizer(self) -> VectorNormScaler:
         """Return the kinematics normalizer for external use (e.g., saving/loading)."""

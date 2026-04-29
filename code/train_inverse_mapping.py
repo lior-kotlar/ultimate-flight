@@ -41,7 +41,7 @@ os.makedirs(RUNS_DIRECTORY, exist_ok=True)
 # DATASET
 # ---------------------------------------------------------
 class InverseMappingDataset(Dataset):
-    def __init__(self, kinematics_list, wing_angles_list, n_samples_per_wingbeat, target_scaler, kinematics_window_size=1, use_scheduled_sampling=False):
+    def __init__(self, kinematics_list, wing_angles_list, speed_list, n_samples_per_wingbeat, target_scaler, kinematics_window_size=1, use_scheduled_sampling=False):
         self.n = n_samples_per_wingbeat
         self.window_size = kinematics_window_size
         self.use_ss = use_scheduled_sampling
@@ -51,35 +51,47 @@ class InverseMappingDataset(Dataset):
         kin_k_items = []
         wing_k_minus_1_items = []
         wing_k_items = []
+        speed_k_minus_1_items = []
+        speed_k_items = []
         
-        for k_seq, w_seq in zip(kinematics_list, wing_angles_list):
+        for k_seq, w_seq, s_seq in zip(kinematics_list, wing_angles_list, speed_list):
             if k_seq.shape[0] <= self.window_size:
                 continue
             
             seq_kin_k = []
             seq_w_prev = []
             seq_w_curr = []
+            seq_s_prev = [] # <--- FIXED: Added this missing list
+            seq_s_curr = []
             
             # Create sliding windows for kinematics
             for t in range(1, k_seq.shape[0] - self.window_size + 1):
                 kin_window = k_seq[t : t + self.window_size].flatten()
                 w_prev = w_seq[t - 1].reshape(self.n * 6)
                 w_curr = w_seq[t].reshape(self.n * 6)
+                s_prev = s_seq[t - 1].flatten() 
+                s_curr = s_seq[t].flatten()     
                 
                 if self.use_ss:
                     seq_kin_k.append(kin_window)
                     seq_w_prev.append(w_prev)
                     seq_w_curr.append(w_curr)
+                    seq_s_prev.append(s_prev) 
+                    seq_s_curr.append(s_curr) 
                 else:
                     kin_k_items.append(kin_window.unsqueeze(0))
                     wing_k_minus_1_items.append(w_prev.unsqueeze(0))
                     wing_k_items.append(w_curr.unsqueeze(0))
+                    speed_k_minus_1_items.append(s_prev.unsqueeze(0)) 
+                    speed_k_items.append(s_curr.unsqueeze(0))         
             
             if self.use_ss and seq_kin_k:
                 kin_k_tensor = torch.stack(seq_kin_k).float()
                 w_prev_tensor = target_scaler.transform(torch.stack(seq_w_prev).float())
                 w_curr_tensor = target_scaler.transform(torch.stack(seq_w_curr).float())
-                self.data.append((kin_k_tensor, w_prev_tensor, w_curr_tensor))
+                s_prev_tensor = torch.stack(seq_s_prev).float() 
+                s_curr_tensor = torch.stack(seq_s_curr).float() 
+                self.data.append((kin_k_tensor, w_prev_tensor, w_curr_tensor, s_prev_tensor, s_curr_tensor))
             
         if not self.use_ss:
             if not kin_k_items:
@@ -88,20 +100,19 @@ class InverseMappingDataset(Dataset):
             self.kin_k = torch.cat(kin_k_items, dim=0).float()
             wing_k_minus_1 = torch.cat(wing_k_minus_1_items, dim=0).float()
             wing_k = torch.cat(wing_k_items, dim=0).float()
+            self.speed_k_minus_1 = torch.cat(speed_k_minus_1_items, dim=0).float() 
+            self.speed_k = torch.cat(speed_k_items, dim=0).float()
 
-            # --- Use the passed target_scaler to transform targets ---
             self.wing_k_minus_1 = target_scaler.transform(wing_k_minus_1)
             self.wing_k = target_scaler.transform(wing_k)
 
     def __len__(self):
-        if self.use_ss:
-            return len(self.data)
+        if self.use_ss: return len(self.data)
         return self.kin_k.shape[0]
 
     def __getitem__(self, idx):
-        if self.use_ss:
-            return self.data[idx]
-        return self.kin_k[idx], self.wing_k_minus_1[idx], self.wing_k[idx]
+        if self.use_ss: return self.data[idx]
+        return self.kin_k[idx], self.wing_k_minus_1[idx], self.wing_k[idx], self.speed_k_minus_1[idx], self.speed_k[idx]
 
 
 # ---------------------------------------------------------
@@ -120,7 +131,8 @@ def train_epoch(
         wing_noise_std=0.0,
         unroll_steps=1,
         maneuver_threshold=0.0,
-        maneuver_weight=1.0
+        maneuver_weight=1.0,
+        speed_loss_weight=1.0
     ):
     model.train()
     total_loss = 0
@@ -130,22 +142,21 @@ def train_epoch(
     # Linear decay for teacher forcing from 1.0 down to 0.0 (only used if use_ss=True)
     teacher_forcing_ratio = max(0.0, 1.0 - (epoch - 1) / max(1, total_epochs))
 
-    for batch_idx, (kin_k, wing_prev, wing_curr) in pbar:
+    for batch_idx, (kin_k, wing_prev, wing_curr, speed_prev, speed_curr) in pbar:
         if not use_ss:
             kin_k = kin_k.to(device)
             wing_prev = wing_prev.to(device)
             wing_curr = wing_curr.to(device)
+            speed_prev = speed_prev.to(device)
+            speed_curr = speed_curr.to(device)
 
             if wing_noise_std > 0.0:
                 noisy_wing_prev = wing_prev + torch.randn_like(wing_prev) * wing_noise_std
             else:
                 noisy_wing_prev = wing_prev
 
-            preds = model(kin_k, noisy_wing_prev)
+            preds_wing, preds_speed = model(kin_k, noisy_wing_prev, speed_prev)
             
-            # --- DEBUGGING: Tell PyTorch to keep the gradient for the predictions ---
-            # preds.retain_grad() 
-
             # Compute weighted loss based on maneuver detection
             batch_size = kin_k.shape[0]
             weights = torch.ones(batch_size, device=device)
@@ -154,14 +165,14 @@ def train_epoch(
             if maneuver_threshold > 0.0:
                 ang_accel = kin_k[:, -3:]
                 mask = torch.any(torch.abs(ang_accel) > maneuver_threshold, dim=1)
-                # if torch.any(mask):
-                #     print(f"\n[DEBUG Batch {batch_idx}] Maneuver samples detected: {mask.sum().item()} out of {batch_size}")
-                # else:
-                #     print(f"\n[DEBUG Batch {batch_idx}] No maneuver samples detected.")
                 weights[mask] = maneuver_weight
 
-            raw_loss = F.mse_loss(preds, wing_curr, reduction='none')
-            loss = (raw_loss.mean(dim=1) * weights).mean()
+            raw_loss_wing = F.mse_loss(preds_wing, wing_curr, reduction='none')
+            loss_wing = (raw_loss_wing.mean(dim=1) * weights).mean()
+            loss_speed = F.mse_loss(preds_speed, speed_curr)
+            
+            loss = loss_wing + (loss_speed * speed_loss_weight)
+
         else:
             loss = torch.tensor(0.0, device=device)
             total_steps = 0
@@ -170,21 +181,26 @@ def train_epoch(
                 seq_kin = kin_k[i].to(device)
                 seq_w_prev = wing_prev[i].to(device)
                 seq_w_curr = wing_curr[i].to(device)
+                seq_speed_prev = speed_prev[i].to(device)
+                seq_speed_curr = speed_curr[i].to(device)
                 
                 T = seq_kin.shape[0]
                 if T == 0:
                     continue
                     
                 curr_input_prev = seq_w_prev[0].unsqueeze(0)
+                curr_speed_prev = seq_speed_prev[0].unsqueeze(0)
+                
                 if wing_noise_std > 0.0:
                     curr_input_prev = curr_input_prev + torch.randn_like(curr_input_prev) * wing_noise_std
                 
-                seq_loss = 0
+                seq_wing_loss = 0
+                seq_speed_loss = 0
 
                 for t in range(T):
                     kin_step = seq_kin[t].unsqueeze(0)
 
-                    pred = model(kin_step, curr_input_prev)
+                    pred_wing, pred_speed = model(kin_step, curr_input_prev, curr_speed_prev)
 
                     # Compute weight based on maneuver detection
                     weight = 1.0
@@ -193,19 +209,24 @@ def train_epoch(
                         if torch.any(torch.abs(ang_accel) > maneuver_threshold):
                             weight = maneuver_weight
 
-                    seq_loss += F.mse_loss(pred, seq_w_curr[t].unsqueeze(0)) * weight
+                    seq_wing_loss += F.mse_loss(pred_wing, seq_w_curr[t].unsqueeze(0)) * weight
+                    seq_speed_loss += F.mse_loss(pred_speed, seq_speed_curr[t].unsqueeze(0)) * weight
 
                     if t < T - 1:
                         if torch.rand(1).item() < teacher_forcing_ratio:
                             curr_input_prev = seq_w_prev[t+1].unsqueeze(0)
+                            curr_speed_prev = seq_speed_prev[t+1].unsqueeze(0)
                             if wing_noise_std > 0.0:
                                 curr_input_prev = curr_input_prev + torch.randn_like(curr_input_prev) * wing_noise_std
                         else:
                             if (t + 1) % unroll_steps == 0:
-                                curr_input_prev = pred.detach()
+                                curr_input_prev = pred_wing.detach()
+                                curr_speed_prev = pred_speed.detach()
                             else:
-                                curr_input_prev = pred
+                                curr_input_prev = pred_wing
+                                curr_speed_prev = pred_speed
                             
+                seq_loss = seq_wing_loss + (seq_speed_loss * speed_loss_weight)
                 loss += seq_loss / T
                 total_steps += 1
                 
@@ -214,18 +235,6 @@ def train_epoch(
         loss = loss / accumulation_steps
         
         loss.backward()
-            
-        # # --- DEBUGGING: Compare the gradient magnitudes immediately after backward() ---
-        # if maneuver_threshold > 0.0 and mask is not None and batch_idx % 50 == 0: # Print every 50 batches
-        #     maneuver_indices = torch.where(mask)[0]
-        #     hover_indices = torch.where(~mask)[0]
-            
-        #     # Only print if we have both types in this specific batch
-        #     if len(maneuver_indices) > 0 and len(hover_indices) > 0:
-        #         grad_maneuver = preds.grad[maneuver_indices].abs().mean().item()
-        #         grad_hover = preds.grad[hover_indices].abs().mean().item()
-        #         ratio = grad_maneuver / grad_hover if grad_hover > 0 else 0
-        #         # print(f"\n[DEBUG Batch {batch_idx}] Grad Magnitude -> Maneuver: {grad_maneuver:.6f} | Hover: {grad_hover:.6f} | Ratio: {ratio:.1f}x")
         
         if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(dataloader):
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -239,19 +248,24 @@ def train_epoch(
     return total_loss / len(dataloader)
 
 
-def evaluate(epoch, model, dataloader, device, disable_tqdm=False, use_ss=False):
+def evaluate(epoch, model, dataloader, device, disable_tqdm=False, use_ss=False, speed_loss_weight=1.0):
     model.eval()
     total_loss = 0
     with torch.no_grad():
         pbar = tqdm(enumerate(dataloader), total=len(dataloader), leave=False, disable=disable_tqdm)
-        for batch_idx, (kin_k, wing_prev, wing_curr) in pbar:
+        for batch_idx, (kin_k, wing_prev, wing_curr, speed_prev, speed_curr) in pbar:
             if not use_ss:
                 kin_k = kin_k.to(device)
                 wing_prev = wing_prev.to(device)
                 wing_curr = wing_curr.to(device)
+                speed_prev = speed_prev.to(device)
+                speed_curr = speed_curr.to(device)
                 
-                preds = model(kin_k, wing_prev)
-                loss = F.mse_loss(preds, wing_curr)
+                preds_wing, preds_speed = model(kin_k, wing_prev, speed_prev)
+                
+                loss_wing = F.mse_loss(preds_wing, wing_curr)
+                loss_speed = F.mse_loss(preds_speed, speed_curr)
+                loss = loss_wing + (loss_speed * speed_loss_weight)
             else:
                 loss = torch.tensor(0.0, device=device)
                 total_steps = 0
@@ -260,23 +274,32 @@ def evaluate(epoch, model, dataloader, device, disable_tqdm=False, use_ss=False)
                     seq_kin = kin_k[i].to(device)
                     seq_w_prev = wing_prev[i].to(device)
                     seq_w_curr = wing_curr[i].to(device)
+                    seq_speed_prev = speed_prev[i].to(device)
+                    seq_speed_curr = speed_curr[i].to(device)
                     
                     T = seq_kin.shape[0]
                     if T == 0:
                         continue
                         
                     curr_input_prev = seq_w_prev[0].unsqueeze(0)
-                    seq_loss = 0
+                    curr_speed_prev = seq_speed_prev[0].unsqueeze(0)
+                    seq_wing_loss = 0
+                    seq_speed_loss = 0
                     
                     for t in range(T):
                         kin_step = seq_kin[t].unsqueeze(0)
-                        pred = model(kin_step, curr_input_prev)
-                        seq_loss += F.mse_loss(pred, seq_w_curr[t].unsqueeze(0))
+                        
+                        pred_wing, pred_speed = model(kin_step, curr_input_prev, curr_speed_prev)
+                        
+                        seq_wing_loss += F.mse_loss(pred_wing, seq_w_curr[t].unsqueeze(0))
+                        seq_speed_loss += F.mse_loss(pred_speed, seq_speed_curr[t].unsqueeze(0))
                         
                         if t < T - 1:
                             # Standard evaluation is pure autoregressive without teacher forcing
-                            curr_input_prev = pred.detach()
+                            curr_input_prev = pred_wing.detach()
+                            curr_speed_prev = pred_speed.detach()
                             
+                    seq_loss = seq_wing_loss + (seq_speed_loss * speed_loss_weight)
                     loss += seq_loss / T
                     total_steps += 1
                     
@@ -292,7 +315,7 @@ def evaluate(epoch, model, dataloader, device, disable_tqdm=False, use_ss=False)
 # ---------------------------------------------------------
 # PIPELINE ENCAPSULATION
 # ---------------------------------------------------------
-def run_training_experiment(config, trainset, valset, train_kinematics_raw, device, run_dir, target_scaler, disable_tqdm=False, conf_idx=None):
+def run_training_experiment(config, trainset, valset, train_kinematics_raw, train_speed_raw, device, run_dir, target_scaler, disable_tqdm=False, conf_idx=None):
     run_label = f"Config {conf_idx}" if conf_idx else "Single Config"
     print(f"\n[{run_label}] Output Directory: {run_dir}")
     os.makedirs(run_dir, exist_ok=True)
@@ -324,11 +347,10 @@ def run_training_experiment(config, trainset, valset, train_kinematics_raw, devi
         pickle.dump(target_scaler, f)
 
     def get_collate_fn(use_ss):
-        if not use_ss:
-            return None
+        if not use_ss: return None
         def collate(batch):
-            kins, w_prevs, w_currs = zip(*batch)
-            return list(kins), list(w_prevs), list(w_currs)
+            kins, w_prevs, w_currs, s_prevs, s_currs = zip(*batch)
+            return list(kins), list(w_prevs), list(w_currs), list(s_prevs), list(s_currs)
         return collate
 
     collate_fn = get_collate_fn(USE_SS)
@@ -346,7 +368,7 @@ def run_training_experiment(config, trainset, valset, train_kinematics_raw, devi
     
     # Fit normalizer on raw train kinematics
     # Important: kinematics_raw shape [T, 12] list -> model fits globally
-    model.fit_normalizer(train_kinematics_raw)
+    model.fit_normalizer(train_kinematics_raw, train_speed_raw)
     model.to(device)
 
     # Optimizer
@@ -439,23 +461,27 @@ def main():
         print(f"   STARTING RUN {run_idx} of {len(config_combinations)} (n_samples={n_samples})")
         print(f"==========================================")
 
-        # 2. Check / Build / Load Dataset for this n_samples
+        SPLIT_BY = config.get("split_by", "max")
         if n_samples not in dataset_cache:
-            input_path = os.path.join("data", "train_datasets", f"train_input_forces_wingbeat_n{n_samples}_splitmin.pt")
-            target_path = os.path.join("data", "train_datasets", f"train_output_kinematics_wingbeat_n{n_samples}_splitmin.pt")
+            input_path = os.path.join("data", "train_datasets", f"train_input_forces_wingbeat_n{n_samples}_split{SPLIT_BY}.pt")
+            target_path = os.path.join("data", "train_datasets", f"train_output_kinematics_wingbeat_n{n_samples}_split{SPLIT_BY}.pt")
+            speed_path = os.path.join("data", "train_datasets", f"train_input_speed_wingbeat_n{n_samples}_split{SPLIT_BY}.pt")
             
             if not (os.path.exists(input_path) and os.path.exists(target_path)):
                 print(f"==> Dataset for n_samples={n_samples} not found. Generating now...")
+                
                 run_per_wingbeat_builder(
                     n_samples_per_wingbeat=n_samples,
                     forces_indication_vector="1111",     
                     use_radians=True,
-                    min_peak_distance=20
+                    min_peak_distance=20,
+                    split_by = SPLIT_BY
                 )
                 
             print(f"==> Loading master dataset files for n_samples={n_samples}...")
             X_full = torch.load(input_path, map_location='cpu')
             y_full = torch.load(target_path, map_location='cpu')
+            s_full = torch.load(speed_path, map_location='cpu')
             
             total_samples = len(X_full)
             if n_samples not in train_indices_cache: # Generate indices per n_samples to account for differing sequence lengths
@@ -469,13 +495,15 @@ def main():
 
             X_train_raw = [X_full[i] for i in train_indices]
             y_train_raw = [y_full[i] for i in train_indices]
+            s_train_raw = [s_full[i] for i in train_indices]
             X_val_raw = [X_full[i] for i in val_indices]
             y_val_raw = [y_full[i] for i in val_indices]
+            s_val_raw = [s_full[i] for i in val_indices]
             
-            dataset_cache[n_samples] = (X_train_raw, y_train_raw, X_val_raw, y_val_raw)
+            dataset_cache[n_samples] = (X_train_raw, y_train_raw, s_train_raw, X_val_raw, y_val_raw, s_val_raw)
             print(f"Dataset split for n_samples={n_samples}: {len(X_train_raw)} Train | {len(X_val_raw)} Val")
             
-        X_train_raw, y_train_raw, X_val_raw, y_val_raw = dataset_cache[n_samples]
+        X_train_raw, y_train_raw, s_train_raw, X_val_raw, y_val_raw, s_val_raw = dataset_cache[n_samples]
 
         target_scaler = NormalizerFactory.create('physicalwing')
         
@@ -484,11 +512,11 @@ def main():
         use_ss = config.get("use_scheduled_sampling", False)
         
         trainset = InverseMappingDataset(
-            X_train_raw, y_train_raw, n_samples, target_scaler, 
+            X_train_raw, y_train_raw, s_train_raw, n_samples, target_scaler, 
             kinematics_window_size=kin_window_size, use_scheduled_sampling=use_ss
         )
         valset = InverseMappingDataset(
-            X_val_raw, y_val_raw, n_samples, target_scaler, 
+            X_val_raw, y_val_raw, s_val_raw, n_samples, target_scaler, 
             kinematics_window_size=kin_window_size, use_scheduled_sampling=use_ss
         )
 
@@ -500,6 +528,7 @@ def main():
             trainset=trainset,
             valset=valset,
             train_kinematics_raw=X_train_raw,
+            train_speed_raw=s_train_raw,
             device=DEVICE,
             run_dir=run_dir,
             target_scaler=target_scaler,

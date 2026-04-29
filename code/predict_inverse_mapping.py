@@ -5,7 +5,6 @@ import torch
 import pickle
 import argparse
 import numpy as np
-from torch.utils.data import DataLoader
 from plotly.subplots import make_subplots
 import plotly.graph_objects as go
 from tqdm.auto import tqdm
@@ -124,24 +123,26 @@ def inverse_transform_sequence_list(scaler, seq_list):
         return seq_list
     return [scaler.inverse_transform(seq) for seq in seq_list]
 
-def predict_autoregressive(model, seq_kin, gt_w_0, target_scaler, device, kinematics_window_size=1):
+def predict_autoregressive(model, seq_kin, gt_s_0, gt_w_0, target_scaler, device, kinematics_window_size=1):
     T = seq_kin.shape[0]
     
-    # Use the scaler to normalize the initial condition
     curr_wing_norm = target_scaler.transform(gt_w_0.unsqueeze(0).to(device))
+    curr_speed = gt_s_0.unsqueeze(0).to(device)
     
-    preds = [gt_w_0.cpu()] # Keep the unnormalized (radians) ground truth for step 0
+    preds = [gt_w_0.cpu()]
     
     for t in range(1, T - kinematics_window_size + 1):
         kin_window = seq_kin[t:t+kinematics_window_size].flatten().unsqueeze(0).to(device)
         
         with torch.no_grad():
-            pred_wing_norm = model(kin_window, curr_wing_norm) 
+            pred_wing_norm, pred_speed = model(kin_window, curr_wing_norm, curr_speed) 
             
-        # Unnormalize model's prediction back to radians
         pred_wing = target_scaler.inverse_transform(pred_wing_norm).squeeze(0).cpu()
         preds.append(pred_wing)
+        
+        # Feed predictions back into the next loop
         curr_wing_norm = pred_wing_norm
+        curr_speed = pred_speed
         
     return torch.stack(preds, dim=0) # [T, n*6]
 
@@ -309,7 +310,7 @@ def save_prediction_plots(predictions, ground_truth_sequences, dataset_features,
 
     print(f"Saved {total} prediction plot html file(s) to: {run_dir}")
 
-def run_prediction_for_directory(run_dir, dataset_features, dataset_targets, ground_truth_sequences, device, output_name):
+def run_prediction_for_directory(run_dir, dataset_features, dataset_speeds, dataset_targets, ground_truth_sequences, device, output_name):
     print(f"\n=== Predicting for run directory: {run_dir}")
     model, config, target_scaler = load_run(run_dir, device)
     n_samples_per_wingbeat = config.get("n_samples_per_wingbeat", 16)
@@ -319,6 +320,7 @@ def run_prediction_for_directory(run_dir, dataset_features, dataset_targets, gro
     
     for i in tqdm(range(len(dataset_features)), desc="Predicting sequences"):
         seq_kin = dataset_features[i] # [T, 12]
+        seq_spd = dataset_speeds[i]   # [T, 1]
         
         gt_w = ground_truth_sequences[i] 
         
@@ -332,9 +334,9 @@ def run_prediction_for_directory(run_dir, dataset_features, dataset_targets, gro
             gt_w = gt_w.reshape(gt_w.shape[0], -1)
             
         gt_w_0 = gt_w[0] # [n*6]
+        gt_s_0 = seq_spd[0].flatten() # NEW: Get the initial ground truth speed
         
-        # Pass the scaler into the loop!
-        preds_seq = predict_autoregressive(model, seq_kin, gt_w_0, target_scaler, device, kinematics_window_size=kin_window_size)
+        preds_seq = predict_autoregressive(model, seq_kin, gt_s_0, gt_w_0, target_scaler, device, kinematics_window_size=kin_window_size)
         all_preds_list.append(preds_seq)
 
     save_payload = {
@@ -401,11 +403,14 @@ def main():
             n_samples = config.get("n_samples_per_wingbeat", 16)
 
             # 2. Construct the expected file paths based on the dataset builder's default naming convention
-            inputs_filename = f"pred_inputs_{args.base_name}_wingbeat_n{n_samples}_splitmin.pt"
-            targets_filename = f"pred_targets_{args.base_name}_wingbeat_n{n_samples}_splitmin.pt"
+            split_by = config.get("split_by", "min")
+            inputs_filename = f"pred_inputs_{args.base_name}_wingbeat_n{n_samples}_split{split_by}.pt"
+            targets_filename = f"pred_targets_{args.base_name}_wingbeat_n{n_samples}_split{split_by}.pt"
+            speeds_filename = f"pred_speeds_{args.base_name}_wingbeat_n{n_samples}_split{split_by}.pt"
             
             inputs_path = os.path.join(args.dataset_dir, inputs_filename)
             targets_path = os.path.join(args.dataset_dir, targets_filename)
+            speeds_path = os.path.join(args.dataset_dir, speeds_filename)
 
             # 3. Validate existence
             if not os.path.exists(inputs_path) or not os.path.exists(targets_path):
@@ -417,11 +422,13 @@ def main():
             # 4. Load the dynamically resolved datasets
             dataset_features, dataset_targets = load_prediction_inputs(inputs_path)
             ground_truth_sequences = load_ground_truth_sequences(targets_path)
+            dataset_speeds = torch.load(speeds_path, map_location='cpu')
 
             # 5. Run prediction (Make sure you still have the shape fix applied to this function from earlier!)
             run_prediction_for_directory(
                 run_dir=run_dir,
                 dataset_features=dataset_features,
+                dataset_speeds=dataset_speeds,
                 dataset_targets=dataset_targets,
                 ground_truth_sequences=ground_truth_sequences,
                 device=device,

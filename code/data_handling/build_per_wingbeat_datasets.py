@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 import torch
 from loguru import logger
+from scipy.interpolate import CubicSpline
 from scipy.signal import find_peaks
 
 from process_data import (
@@ -73,11 +74,11 @@ def _sample_wingbeat_segment(
     split_by: str = 'min',
 ) -> np.ndarray:
     """
-    Convert a [Z, 6] wingbeat segment to [n_samples, 6] using time-proportional sampling.
+    Convert a [Z, 6] wingbeat segment to [n_samples, 6] using cubic spline interpolation.
 
-    The opposite extreme (peak) from the boundary definition is dynamically located
-    and explicitly included in the output at its natural time-proportional position.
-    Two-phase interpolation is used: first phase from start to peak, second from peak to end.
+    Samples are placed at equal intervals across the wingbeat, with the explicit
+    exception that the opposite extreme (peak) from the boundary definition is
+    dynamically located and guaranteed to be one of the sample points.
 
     Args:
         segment: Wing angle data [Z, 6] representing one wingbeat interval
@@ -101,55 +102,59 @@ def _sample_wingbeat_segment(
     if z == 1:
         return np.repeat(segment, repeats=n_samples, axis=0)
 
-    # Compute stroke signal to find the opposite extreme
+    # Compute peaks for left and right strokes separately
     left_phi = segment[:, 0]
     right_phi = segment[:, 3]
-    stroke_signal = 0.5 * (left_phi + right_phi)
 
-    # Find the opposite extreme within this segment
+    # Find the opposite extreme within each stroke separately
     if split_by == 'max':
         # Boundaries are at maxima, so find minimum as the opposite extreme
-        peak_idx = np.argmin(stroke_signal)
+        left_peak_idx = np.argmin(left_phi)
+        right_peak_idx = np.argmin(right_phi)
     else:  # split_by == 'min' (default)
         # Boundaries are at minima, so find maximum as the opposite extreme
-        peak_idx = np.argmax(stroke_signal)
+        left_peak_idx = np.argmax(left_phi)
+        right_peak_idx = np.argmax(right_phi)
 
-    # Calculate time-proportional allocation
-    proportion = peak_idx / max(1, z - 1) if z > 1 else 0.5
-    n_first_phase = max(1, int(round(proportion * n_samples)))
-    # Add 1 to n_second_phase to account for the duplicate peak we'll remove during concatenation
-    n_second_phase = n_samples - n_first_phase + 1
+    # Take the average index between the two peaks
+    peak_idx = int(round((left_peak_idx + right_peak_idx) / 2.0))
 
-    # Helper function to interpolate a segment
-    def interpolate_segment(seg: np.ndarray, n: int) -> np.ndarray:
-        """Linearly interpolate segment to n samples."""
-        seg_len = seg.shape[0]
-        if seg_len == 1:
-            return np.repeat(seg, repeats=n, axis=0)
+    # Normalize peak index to [0, 1]
+    peak_normalized = peak_idx / (z - 1) if z > 1 else 0.5
 
-        x_old = np.arange(seg_len, dtype=np.float64)
-        x_new = np.linspace(0.0, float(seg_len - 1), num=n, endpoint=True)
+    # Create equally-spaced sample positions
+    x_sample = np.linspace(0.0, 1.0, num=n_samples, endpoint=True)
 
-        result = np.empty((n, 6), dtype=seg.dtype)
-        for col in range(6):
-            result[:, col] = np.interp(x_new, x_old, seg[:, col])
-        return result
+    # Ensure peak is one of the sample positions by replacing the closest one
+    distances = np.abs(x_sample - peak_normalized)
+    closest_idx = np.argmin(distances)
 
-    # Phase 1: Interpolate from start to peak (inclusive)
-    phase1_segment = segment[: peak_idx + 1]
-    phase1_samples = interpolate_segment(phase1_segment, n_first_phase)
+    if not np.isclose(x_sample[closest_idx], peak_normalized, atol=1e-10):
+        x_sample[closest_idx] = peak_normalized
+        x_sample = np.sort(x_sample)
 
-    # Phase 2: Interpolate from peak to end (inclusive)
-    phase2_segment = segment[peak_idx:]
-    phase2_samples = interpolate_segment(phase2_segment, n_second_phase)
+    # Create the x-axis for the original data (in normalized time)
+    x_old = np.linspace(0.0, 1.0, num=z, endpoint=True)
 
-    # Concatenate phases, removing duplicate peak sample from phase2
-    result = np.vstack([phase1_samples, phase2_samples[1:]])
+    # Interpolate using cubic spline for each column
+    result = np.empty((n_samples, 6), dtype=segment.dtype)
+    for col in range(6):
+        cs = CubicSpline(x_old, segment[:, col])
+        result[:, col] = cs(x_sample)
 
-    # With the +1 adjustment to n_second_phase, we should have exactly n_samples
-    assert result.shape[0] == n_samples, f"Expected {n_samples} samples, got {result.shape[0]}"
     return result
 
+
+def _find_exact_peak(signal: np.ndarray, approx_idx: int, split_by: str, max_margin: int = 10) -> int:
+    start_idx = max(0, approx_idx - max_margin)
+    end_idx = min(len(signal), approx_idx + max_margin + 1)
+    if start_idx >= end_idx:
+        return approx_idx
+    window = signal[start_idx:end_idx]
+    if split_by == 'max':
+        return start_idx + int(np.argmax(window))
+    else:  # 'min'
+        return start_idx + int(np.argmin(window))
 
 def _build_per_wingbeat_for_file(
     h5_path: str,
@@ -159,7 +164,7 @@ def _build_per_wingbeat_for_file(
     min_peak_distance: int,
     min_peak_prominence: Optional[float],
     split_by: str = 'min',
-) -> Tuple[np.ndarray, np.ndarray, dict]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
     body_matrix, wing_matrix = _extract_features_and_targets(
         h5_path,
         forces_indication_vector,
@@ -175,6 +180,11 @@ def _build_per_wingbeat_for_file(
 
     beat_body: List[np.ndarray] = []
     beat_wings: List[np.ndarray] = []
+    beat_speed: List[float] = []
+
+    left_phi = wing_matrix[:, 0]
+    right_phi = wing_matrix[:, 3]
+    delta_T = 1.0 / 16000.0  # SAMPLING_RATE is 16000
 
     for start, end in intervals:
         body_segment = body_matrix[start:end]
@@ -186,17 +196,30 @@ def _build_per_wingbeat_for_file(
         body_mean = np.mean(body_segment, axis=0)
         wing_sampled = _sample_wingbeat_segment(wing_segment, n_samples=n_samples_per_wingbeat, split_by=split_by)
 
+        start_l = _find_exact_peak(left_phi, start, split_by)
+        end_l = _find_exact_peak(left_phi, end, split_by)
+        n_l = end_l - start_l
+
+        start_r = _find_exact_peak(right_phi, start, split_by)
+        end_r = _find_exact_peak(right_phi, end, split_by)
+        n_r = end_r - start_r
+
+        speed_val = (n_l * delta_T + n_r * delta_T) / 2.0
+
         beat_body.append(body_mean)
         beat_wings.append(wing_sampled)
+        beat_speed.append(speed_val)
 
     if beat_body:
         body_out = np.stack(beat_body, axis=0).astype(np.float32)
         wings_out = np.stack(beat_wings, axis=0).astype(np.float32)
+        speed_out = np.array(beat_speed, dtype=np.float32).reshape(-1, 1)
     else:
         body_out = np.empty((0, body_matrix.shape[1]), dtype=np.float32)
         wings_out = np.empty((0, n_samples_per_wingbeat, 6), dtype=np.float32)
+        speed_out = np.empty((0, 1), dtype=np.float32)
 
-    if np.isnan(body_out).any() or np.isnan(wings_out).any():
+    if np.isnan(body_out).any() or np.isnan(wings_out).any() or np.isnan(speed_out).any():
         raise ValueError(f"NaNs found after wingbeat conversion for {h5_path}")
 
     metadata = {
@@ -206,7 +229,7 @@ def _build_per_wingbeat_for_file(
         "body_dim": int(body_out.shape[1]) if body_out.ndim == 2 else 0,
         "output_shape": tuple(wings_out.shape),
     }
-    return body_out, wings_out, metadata
+    return body_out, wings_out, speed_out, metadata
 
 
 def _build_train_dataset(
@@ -217,16 +240,17 @@ def _build_train_dataset(
     min_peak_prominence: Optional[float],
     save_suffix: str,
     split_by: str = 'min',
-) -> Tuple[str, str]:
+) -> Tuple[str, str, str]:
     os.makedirs(TRAIN_DATASETS_DIR, exist_ok=True)
 
     all_body_inputs: List[torch.Tensor] = []
     all_wing_targets: List[torch.Tensor] = []
+    all_speed_inputs: List[torch.Tensor] = []
 
     files = sorted(f for f in os.listdir(PROCESSED_TRAIN_FLIGHT_DATA_DIR) if f.endswith(".h5"))
     for file_name in files:
         path = os.path.join(PROCESSED_TRAIN_FLIGHT_DATA_DIR, file_name)
-        body_out, wings_out, metadata = _build_per_wingbeat_for_file(
+        body_out, wings_out, speed_out, metadata = _build_per_wingbeat_for_file(
             path,
             forces_indication_vector=forces_indication_vector,
             n_samples_per_wingbeat=n_samples_per_wingbeat,
@@ -237,6 +261,7 @@ def _build_train_dataset(
         )
         all_body_inputs.append(torch.from_numpy(body_out))
         all_wing_targets.append(torch.from_numpy(wings_out))
+        all_speed_inputs.append(torch.from_numpy(speed_out))
         logger.info(
             f"train {metadata['file']}: frames={metadata['frames']}, "
             f"wingbeats={metadata['wingbeats']}, body_dim={metadata['body_dim']}, "
@@ -245,14 +270,15 @@ def _build_train_dataset(
 
     input_path = os.path.join(TRAIN_DATASETS_DIR, f"train_input_forces_{save_suffix}.pt")
     target_path = os.path.join(TRAIN_DATASETS_DIR, f"train_output_kinematics_{save_suffix}.pt")
+    speed_path = os.path.join(TRAIN_DATASETS_DIR, f"train_input_speed_{save_suffix}.pt")
     torch.save(all_body_inputs, input_path)
     torch.save(all_wing_targets, target_path)
+    torch.save(all_speed_inputs, speed_path)
 
     logger.info(
         f"Saved per-wingbeat train dataset with {len(all_body_inputs)} sequences: "
-        f"{input_path}, {target_path}"
     )
-    return input_path, target_path
+    return input_path, target_path, speed_path
 
 
 def _build_prediction_datasets(
@@ -271,7 +297,7 @@ def _build_prediction_datasets(
 
     for file_name in files:
         path = os.path.join(PROCESSED_PREDICTION_FLIGHT_DATA_DIR, file_name)
-        body_out, wings_out, metadata = _build_per_wingbeat_for_file(
+        body_out, wings_out, speed_out, metadata = _build_per_wingbeat_for_file(
             path,
             forces_indication_vector=forces_indication_vector,
             n_samples_per_wingbeat=n_samples_per_wingbeat,
@@ -289,9 +315,11 @@ def _build_prediction_datasets(
 
         input_path = os.path.join(PREDICTION_DATASETS_DIR, f"pred_inputs_{base_name}_{save_suffix}.pt")
         target_path = os.path.join(PREDICTION_DATASETS_DIR, f"pred_targets_{base_name}_{save_suffix}.pt")
+        speed_path = os.path.join(PREDICTION_DATASETS_DIR, f"pred_speeds_{base_name}_{save_suffix}.pt")
 
         torch.save([torch.from_numpy(body_out)], input_path)
         torch.save([torch.from_numpy(wings_out)], target_path)
+        torch.save([torch.from_numpy(speed_out)], speed_path)
 
         logger.info(
             f"pred {metadata['file']}: frames={metadata['frames']}, "
@@ -328,7 +356,7 @@ def run_per_wingbeat_builder(
 
     suffix = save_suffix or f"wingbeat_n{n_samples_per_wingbeat}_split{split_by}"
 
-    train_input_path, train_target_path = _build_train_dataset(
+    train_input_path, train_target_path, train_speed_path = _build_train_dataset(
         forces_indication_vector=forces_indication_vector,
         n_samples_per_wingbeat=n_samples_per_wingbeat,
         use_radians=use_radians,
@@ -351,6 +379,7 @@ def run_per_wingbeat_builder(
     logger.info("Per-wingbeat dataset build complete.")
     logger.info(f"Train inputs: {train_input_path}")
     logger.info(f"Train targets: {train_target_path}")
+    logger.info(f"Train speeds: {train_speed_path}")
     logger.info(f"Prediction datasets created: {pred_count}")
 
 
@@ -402,7 +431,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--split_by",
         type=str,
         choices=['min', 'max'],
-        default='min',
+        default='max',
         help="Wingbeat boundary definition: 'min' for backwardmost points, 'max' for forwardmost points (default: min)",
     )
     return parser
