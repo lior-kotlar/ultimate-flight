@@ -130,6 +130,7 @@ def predict_autoregressive(model, seq_kin, gt_s_0, gt_w_0, target_scaler, device
     curr_speed = gt_s_0.unsqueeze(0).to(device)
     
     preds = [gt_w_0.cpu()]
+    preds_speed = [gt_s_0.cpu()]
     
     for t in range(1, T - kinematics_window_size + 1):
         kin_window = seq_kin[t:t+kinematics_window_size].flatten().unsqueeze(0).to(device)
@@ -139,14 +140,15 @@ def predict_autoregressive(model, seq_kin, gt_s_0, gt_w_0, target_scaler, device
             
         pred_wing = target_scaler.inverse_transform(pred_wing_norm).squeeze(0).cpu()
         preds.append(pred_wing)
+        preds_speed.append(pred_speed.flatten().cpu())
         
         # Feed predictions back into the next loop
         curr_wing_norm = pred_wing_norm
         curr_speed = pred_speed
         
-    return torch.stack(preds, dim=0) # [T, n*6]
+    return torch.stack(preds, dim=0), torch.stack(preds_speed, dim=0) # [T, n*6], [T]
 
-def make_wing_angle_figure(pred_seq, gt_seq, kin_seq, n_samples_per_wingbeat, sample_idx, run_name):
+def make_wing_angle_figure(pred_seq, pred_speed, gt_seq, gt_speed, kin_seq, n_samples_per_wingbeat, sample_idx, run_name):
     # ==========================================
     # TOGGLE ANGULAR VELOCITY PLOTS HERE
     PLOT_ANGULAR_VELOCITY = True
@@ -158,6 +160,7 @@ def make_wing_angle_figure(pred_seq, gt_seq, kin_seq, n_samples_per_wingbeat, sa
         "Left Wing - Stroke (φ)", "Right Wing - Stroke (φ)",
         "Left Wing - Deviation (θ)", "Right Wing - Deviation (θ)",
         "Left Wing - Roll/Rotation (ψ)", "Right Wing - Roll/Rotation (ψ)",
+        "Speed Value", ""
     ]
 
     if PLOT_ANGULAR_VELOCITY:
@@ -166,36 +169,49 @@ def make_wing_angle_figure(pred_seq, gt_seq, kin_seq, n_samples_per_wingbeat, sa
             "Body Angular Velocity Y (Pitch Rate)", 
             "Body Angular Velocity Z (Yaw Rate)"
         ])
-        rows = 6
+        rows = 7
         specs = [
             [{}, {}],
             [{}, {}],
             [{}, {}],
             [{"colspan": 2}, None],
             [{"colspan": 2}, None],
+            [{"colspan": 2}, None],
             [{"colspan": 2}, None]
         ]
-        fig_height = 1600
+        fig_height = 1800
     else:
-        rows = 3
-        specs = None
-        fig_height = 1000
+        rows = 4
+        specs = [
+            [{}, {}],
+            [{}, {}],
+            [{}, {}],
+            [{"colspan": 2}, None]
+        ]
+        fig_height = 1200
 
     fig = make_subplots(
         rows=rows,
         cols=2,
         shared_xaxes="all", # Share X axis across all plots so zooming syncs perfectly
         subplot_titles=subplot_titles,
-        vertical_spacing=0.04, 
+        vertical_spacing=0.03, 
         horizontal_spacing=0.08,
         specs=specs
     )
 
     pred_seq = pred_seq.reshape(-1, 6)
     gt_seq = gt_seq.reshape(-1, 6)
+    
+    pred_speed = pred_speed.reshape(-1)
+    gt_speed = gt_speed.reshape(-1)
 
     gt_x = np.arange(gt_seq.shape[0])
     pred_x = np.arange(pred_seq.shape[0])
+
+    # Speed x-axis (measured per wingbeat, aligned with start of wingbeat)
+    gt_speed_x = np.arange(gt_speed.shape[0]) * n_samples_per_wingbeat
+    pred_speed_x = np.arange(pred_speed.shape[0]) * n_samples_per_wingbeat
 
     angle_names = ["Stroke", "Deviation", "Roll"] 
 
@@ -238,8 +254,26 @@ def make_wing_angle_figure(pred_seq, gt_seq, kin_seq, n_samples_per_wingbeat, sa
 
         fig.update_yaxes(title_text="Angle (rad)", row=row, col=1)
         fig.update_yaxes(title_text="Angle (rad)", row=row, col=2)
+        
+    # --- PLOT SPEED (Row 4) ---
+    speed_row = 4
+    fig.add_trace(
+        go.Scatter(x=gt_speed_x, y=gt_speed, mode="lines", 
+                   name="Ground Truth (Speed)", 
+                   legendgroup="gt_speed", 
+                   line=dict(color="#1f77b4")),
+        row=speed_row, col=1
+    )
+    fig.add_trace(
+        go.Scatter(x=pred_speed_x, y=pred_speed, mode="lines", 
+                   name="Prediction (Speed)", 
+                   legendgroup="pred_speed", 
+                   line=dict(color="#d62728", dash="dash")),
+        row=speed_row, col=1
+    )
+    fig.update_yaxes(title_text="Speed Value", row=speed_row, col=1)
 
-    # --- PLOT ANGULAR ACCELERATIONS (Rows 4-6) ---
+    # --- PLOT ANGULAR ACCELERATIONS (Rows 5-7) ---
     if PLOT_ANGULAR_VELOCITY and kin_seq is not None:
         # Align kinematics X-axis with wing samples X-axis by multiplying by n_samples
         kin_x = np.arange(kin_seq.shape[0]) * n_samples_per_wingbeat + (n_samples_per_wingbeat / 2)
@@ -247,7 +281,7 @@ def make_wing_angle_figure(pred_seq, gt_seq, kin_seq, n_samples_per_wingbeat, sa
         vel_names = ["Angular Accel X", "Angular Accel Y", "Angular Accel Z"]
         
         for i, idx in enumerate(ANGULAR_VEL_INDICES):
-            row = i + 4
+            row = i + 5
             fig.add_trace(
                 go.Scatter(
                     x=kin_x, 
@@ -260,10 +294,9 @@ def make_wing_angle_figure(pred_seq, gt_seq, kin_seq, n_samples_per_wingbeat, sa
             )
             fig.update_yaxes(title_text="Accel (rad/s²)", row=row, col=1)
             
-        fig.update_xaxes(title_text="Time Step (Samples)", row=6, col=1)
+        fig.update_xaxes(title_text="Time Step (Samples)", row=7, col=1)
     else:
-        fig.update_xaxes(title_text="Time Step (Samples)", row=3, col=1)
-        fig.update_xaxes(title_text="Time Step (Samples)", row=3, col=2)
+        fig.update_xaxes(title_text="Time Step (Samples)", row=speed_row, col=1)
 
     fig.update_layout(
         title_text=f"Prediction vs Ground Truth | {run_name} | Sample {sample_idx}",
@@ -274,7 +307,7 @@ def make_wing_angle_figure(pred_seq, gt_seq, kin_seq, n_samples_per_wingbeat, sa
     )
     return fig
 
-def save_prediction_plots(predictions, ground_truth_sequences, dataset_features, n_samples_per_wingbeat, run_dir):
+def save_prediction_plots(predictions, predicted_speeds, ground_truth_sequences, ground_truth_speeds, dataset_features, n_samples_per_wingbeat, run_dir):
     if len(predictions) == 0:
         print("No predictions found. Skipping plot generation.")
         return
@@ -283,14 +316,18 @@ def save_prediction_plots(predictions, ground_truth_sequences, dataset_features,
 
     for sample_idx in range(total):
         pred_seq = predictions[sample_idx]
+        pred_speed = predicted_speeds[sample_idx]
         gt_seq = ground_truth_sequences[sample_idx]
+        gt_speed = ground_truth_speeds[sample_idx]
         kin_seq = dataset_features[sample_idx]
 
         # Truncate to common length (wingbeats)
-        common_len = min(pred_seq.shape[0], gt_seq.shape[0], kin_seq.shape[0])
+        common_len = min(pred_seq.shape[0], gt_seq.shape[0], kin_seq.shape[0], pred_speed.shape[0], gt_speed.shape[0])
         pred_seq = pred_seq[:common_len]
         gt_seq = gt_seq[:common_len]
         kin_seq = kin_seq[:common_len]
+        pred_speed = pred_speed[:common_len]
+        gt_speed = gt_speed[:common_len]
         
         # Ensure we flatten the gt similarly if it's [T, n, 6]
         if gt_seq.ndim == 3:
@@ -298,7 +335,9 @@ def save_prediction_plots(predictions, ground_truth_sequences, dataset_features,
 
         fig = make_wing_angle_figure(
             pred_seq=pred_seq.numpy(),
+            pred_speed=pred_speed.numpy(),
             gt_seq=gt_seq.numpy(),
+            gt_speed=gt_speed.numpy(),
             kin_seq=kin_seq.numpy(),
             n_samples_per_wingbeat=n_samples_per_wingbeat,
             sample_idx=sample_idx,
@@ -317,6 +356,7 @@ def run_prediction_for_directory(run_dir, dataset_features, dataset_speeds, data
     kin_window_size = config.get("kinematics_window_size", 1)
 
     all_preds_list = []
+    all_preds_speed_list = []
     
     for i in tqdm(range(len(dataset_features)), desc="Predicting sequences"):
         seq_kin = dataset_features[i] # [T, 12]
@@ -336,11 +376,13 @@ def run_prediction_for_directory(run_dir, dataset_features, dataset_speeds, data
         gt_w_0 = gt_w[0] # [n*6]
         gt_s_0 = seq_spd[0].flatten() # NEW: Get the initial ground truth speed
         
-        preds_seq = predict_autoregressive(model, seq_kin, gt_s_0, gt_w_0, target_scaler, device, kinematics_window_size=kin_window_size)
+        preds_seq, preds_speed_seq = predict_autoregressive(model, seq_kin, gt_s_0, gt_w_0, target_scaler, device, kinematics_window_size=kin_window_size)
         all_preds_list.append(preds_seq)
+        all_preds_speed_list.append(preds_speed_seq)
 
     save_payload = {
         "predictions": all_preds_list,
+        "predicted_speeds": all_preds_speed_list,
         "run_dir": run_dir,
     }
 
@@ -371,7 +413,9 @@ def run_prediction_for_directory(run_dir, dataset_features, dataset_speeds, data
 
     save_prediction_plots(
         predictions=all_preds_list, 
+        predicted_speeds=all_preds_speed_list,
         ground_truth_sequences=ground_truth_sequences, 
+        ground_truth_speeds=dataset_speeds,
         dataset_features=dataset_features, # <--- ADDED THIS LINE
         n_samples_per_wingbeat=n_samples_per_wingbeat,
         run_dir=run_dir
